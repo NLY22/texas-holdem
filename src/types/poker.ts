@@ -25,6 +25,38 @@ export interface HandEvaluation {
   bestFive: Card[];
 }
 
+export type SeatStatus = 'ACTIVE' | 'SITTING_OUT' | 'BUSTED' | 'DISCONNECTED';
+
+export type BotPersonality = 'LOOSE' | 'TAG' | 'LAG';
+
+export type TableTheme = 'emerald' | 'obsidian' | 'navy';
+
+export interface RoomConfig {
+  smallBlind: number;
+  bigBlind: number;
+  ante: number;
+  startingChips: number;
+  actionTimeoutSec: number; // 0 = 不限时
+  autoNextHand: boolean; // false = 手动下一手, true = 5秒自动续局
+  blindEscalationHands: number; // 0 = 固定盲注, >0 = 每N手翻倍
+}
+
+export const DEFAULT_ROOM_CONFIG: RoomConfig = {
+  smallBlind: 10,
+  bigBlind: 20,
+  ante: 0,
+  startingChips: 1000,
+  actionTimeoutSec: 0,
+  autoNextHand: false,
+  blindEscalationHands: 0,
+};
+
+export interface LastActionBadge {
+  label: string;
+  tone: 'fold' | 'check' | 'call' | 'raise' | 'allin' | 'sitout' | 'show';
+  handNumber: number;
+}
+
 export interface Player {
   id: string;
   name: string;
@@ -38,6 +70,15 @@ export interface Player {
   isBot: boolean;
   seatIndex: number; // 0 - 5
   showCards?: boolean;
+  status?: SeatStatus;
+  totalBuyIn?: number;
+  botPersonality?: BotPersonality;
+  removeAfterHand?: boolean;
+  sitOutAfterHand?: boolean;
+  lastAction?: LastActionBadge;
+  handsPlayed?: number;
+  handsWon?: number;
+  handStartChips?: number;
 }
 
 export type GameStage = 'WAITING' | 'PREFLOP' | 'FLOP' | 'TURN' | 'RIVER' | 'SHOWDOWN';
@@ -61,6 +102,36 @@ export interface WinnerInfo {
   amount: number;
   handName: string;
   cards: Card[];
+  potLabel?: string;
+}
+
+export interface LedgerEntry {
+  playerId: string;
+  name: string;
+  isBot: boolean;
+  totalBuyIn: number;
+  currentChips: number;
+  handsPlayed: number;
+  handsWon: number;
+  status: 'SEATED' | 'LEFT';
+  leftAt?: number;
+}
+
+export interface HandLogEntry {
+  handNumber: number;
+  timestamp: number;
+  winners: { name: string; amount: number; handName: string }[];
+  communityCards: Card[];
+  totalPot: number;
+  actions: string[];
+}
+
+export interface QuickChatEvent {
+  id: string;
+  playerId: string;
+  name: string;
+  text: string;
+  timestamp: number;
 }
 
 export interface GameState {
@@ -76,22 +147,45 @@ export interface GameState {
   smallBlindIndex: number;
   bigBlindIndex: number;
   activePlayerIndex: number;
-  pendingPlayerIds: string[]; // 本轮待行动玩家列表 (核心状态机保证)
+  pendingPlayerIds: string[]; // 本轮待行动玩家列表
+  cannotRaiseIds?: string[]; // 短全下后本街禁止再加注的已行动玩家
   lastRaiserIndex: number;
   players: (Player | null)[];
   winners: WinnerInfo[];
   smallBlind: number;
   bigBlind: number;
+  ante?: number;
   handNumber: number;
+  roundNumber?: number;
+  config?: RoomConfig;
+  ledger?: Record<string, LedgerEntry>;
+  handHistory?: HandLogEntry[];
+  currentHandActions?: string[];
+  turnDeadline?: number;
+  nextHandDeadline?: number;
+  earlyWinCanShow?: boolean;
+  rabbitCards?: Card[];
+  hasRabbitHunted?: boolean;
+  deadPotMoney?: number;
+  actionSeq?: number;
 }
 
-export type P2PMessage =
-  | { type: 'JOIN_REQUEST'; senderId?: string; name: string; avatar: string; seatIndex?: number }
-  | { type: 'JOIN_RESPONSE'; success: boolean; state?: GameState; error?: string }
-  | { type: 'STATE_UPDATE'; state: GameState }
-  | { type: 'DEAL_CARDS'; cards: Card[] }
+export type ClientCommand =
+  | { type: 'JOIN_REQUEST'; name: string; avatar: string; seatIndex?: number }
   | { type: 'PLAYER_ACTION'; action: GameAction }
-  | { type: 'REBUY_REQUEST'; playerId: string }
-  | { type: 'PLAYER_LEAVE'; playerId: string }
-  | { type: 'CHAT_MESSAGE'; sender: string; text: string }
-  | { type: 'RESTART_GAME' };
+  | { type: 'START_HAND' }
+  | { type: 'ADD_BOT'; seatIndex?: number; personality?: BotPersonality }
+  | { type: 'REMOVE_BOT'; seatIndex: number }
+  | { type: 'CLEAR_BOTS' }
+  | { type: 'SIT_AT_SEAT'; seatIndex: number }
+  | { type: 'TOGGLE_SIT_OUT' }
+  | { type: 'REBUY_REQUEST'; mode?: 'rebuy' | 'topup' }
+  | { type: 'KICK_PLAYER'; seatIndex: number }
+  | { type: 'TRANSFER_HOST'; targetPlayerId: string }
+  | { type: 'UPDATE_CONFIG'; config: Partial<RoomConfig> }
+  | { type: 'SHOW_WINNER_CARDS' }
+  | { type: 'RABBIT_HUNT' }
+  | { type: 'QUICK_CHAT'; text: string }
+  | { type: 'RESET_TABLE' }
+  | { type: 'DISSOLVE_ROOM' }
+  | { type: 'PLAYER_LEAVE' };

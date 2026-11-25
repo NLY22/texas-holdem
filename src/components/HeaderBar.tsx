@@ -1,26 +1,54 @@
 import React, { useState, useEffect } from 'react';
-import { Volume2, VolumeX, Share2, Bot, Play, QrCode, HelpCircle, X, Check } from 'lucide-react';
+import {
+  Volume2,
+  VolumeX,
+  Share2,
+  Bot,
+  Play,
+  QrCode,
+  HelpCircle,
+  X,
+  Check,
+  Sliders,
+  History,
+  Trophy,
+} from 'lucide-react';
 import { soundManager } from '../audio/sounds';
+import { ConnectionStatus } from '../network/p2p';
 import QRCode from 'qrcode';
 
 interface HeaderBarProps {
   roomId: string;
   isHost: boolean;
+  isPractice: boolean;
   canStart: boolean;
   isTableFull: boolean;
+  handNumber: number;
+  smallBlind: number;
+  bigBlind: number;
+  connectionStatus: ConnectionStatus;
   onStartHand: () => void;
   onAddBot: () => void;
-  handNumber: number;
+  onOpenHistory: () => void;
+  onOpenSettings: () => void;
+  onOpenSettlement: () => void;
 }
 
 export const HeaderBar: React.FC<HeaderBarProps> = ({
   roomId,
   isHost,
+  isPractice,
   canStart,
   isTableFull,
+  handNumber,
+  smallBlind,
+  bigBlind,
+  connectionStatus,
   onStartHand,
   onAddBot,
-  handNumber,
+  onOpenHistory,
+  onOpenSettings,
+  onOpenSettlement,
 }) => {
   const [muted, setMuted] = useState(!soundManager.enabled);
   const [copied, setCopied] = useState(false);
@@ -62,95 +90,127 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
     }
   };
 
+  const statusConfig = isPractice
+    ? { dot: 'bg-emerald-400', label: '本地' }
+    : connectionStatus === 'connected'
+    ? { dot: 'bg-emerald-400', label: '在线' }
+    : connectionStatus === 'reconnecting' || connectionStatus === 'connecting'
+    ? { dot: 'bg-amber-400 animate-pulse', label: '重连中' }
+    : { dot: 'bg-rose-500', label: '离线' };
+
   return (
     <>
-      <header className="w-full flex items-center justify-between px-3 sm:px-6 py-2.5 bg-black/60 backdrop-blur-md border-b border-white/10 z-30 select-none">
-        {/* 房间号与局数 */}
-        <div className="flex items-center gap-2 sm:gap-3">
-          <div className="flex items-center gap-1.5 bg-neutral-900/90 px-2.5 sm:px-3 py-1 rounded-full border border-amber-500/30 shadow-inner">
-            <span className="text-xs text-neutral-400 font-medium">房间:</span>
-            <span className="text-xs sm:text-sm font-mono font-black text-amber-400 tracking-wider">
+      <header className="w-full flex items-center justify-between px-2.5 sm:px-5 py-2 bg-black/65 backdrop-blur-md border-b border-white/10 z-30 select-none gap-1.5">
+        {/* 左侧：房间号 + 网络状态 + 盲注/手数 */}
+        <div className="flex items-center gap-1.5 sm:gap-2.5 min-w-0">
+          <div className="flex items-center gap-1.5 bg-neutral-900/90 px-2.5 py-1 rounded-full border border-amber-500/30 shadow-inner shrink-0">
+            <span className={`w-2 h-2 rounded-full ${statusConfig.dot}`} title={statusConfig.label} />
+            <span className="text-[11px] sm:text-xs font-mono font-black text-amber-400 tracking-wider">
               {roomId}
             </span>
           </div>
 
-          <span className="hidden sm:inline-block text-xs text-neutral-400 font-mono">
-            第 {handNumber} 局
+          <span className="hidden md:inline-block text-[11px] text-neutral-400 font-mono whitespace-nowrap">
+            第 {handNumber} 手 · 盲注 {smallBlind}/{bigBlind}
           </span>
         </div>
 
-        {/* 快捷操作区 */}
-        <div className="flex items-center gap-1.5 sm:gap-2">
-          {/* 复制邀请 */}
-          <button
-            onClick={copyInviteLink}
-            className={`flex items-center gap-1 px-2.5 py-1 text-xs rounded-lg transition-all ${
-              copied
-                ? 'bg-emerald-600/30 border border-emerald-400/50 text-emerald-300'
-                : 'bg-white/10 hover:bg-white/20 text-neutral-200'
-            }`}
-            title="复制邀请链接"
-          >
-            {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Share2 className="w-3.5 h-3.5" />}
-            <span className={copied ? 'inline font-bold' : 'hidden sm:inline'}>
-              {copied ? '已复制' : '邀请'}
-            </span>
-          </button>
+        {/* 右侧操作区 */}
+        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+          {!isPractice && (
+            <>
+              <button
+                onClick={copyInviteLink}
+                className={`flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-all ${
+                  copied
+                    ? 'bg-emerald-600/30 border border-emerald-400/50 text-emerald-300'
+                    : 'bg-white/10 hover:bg-white/20 text-neutral-200'
+                }`}
+                title="复制邀请链接"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Share2 className="w-3.5 h-3.5" />}
+                <span className={copied ? 'inline font-bold' : 'hidden sm:inline'}>
+                  {copied ? '已复制' : '邀请'}
+                </span>
+              </button>
 
-          {/* 手机扫码入桌 */}
-          <button
-            onClick={handleOpenQr}
-            className="flex items-center gap-1 px-2.5 py-1 bg-white/10 hover:bg-white/20 text-neutral-200 text-xs rounded-lg transition-all"
-            title="手机扫码加入"
-          >
-            <QrCode className="w-3.5 h-3.5 text-amber-300" />
-            <span className="hidden sm:inline">扫码</span>
-          </button>
+              <button
+                onClick={handleOpenQr}
+                className="flex items-center gap-1 px-2 py-1 bg-white/10 hover:bg-white/20 text-neutral-200 text-xs rounded-lg transition-all"
+                title="手机扫码加入"
+              >
+                <QrCode className="w-3.5 h-3.5 text-amber-300" />
+                <span className="hidden lg:inline">扫码</span>
+              </button>
+            </>
+          )}
 
-          {/* 添加电脑 (未满桌时可用) */}
           {isHost && !isTableFull && (
             <button
               onClick={onAddBot}
-              className="flex items-center gap-1 px-2.5 py-1 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-500/30 text-emerald-300 text-xs rounded-lg transition-all"
-              title="添加一个 AI 玩家"
+              className="flex items-center gap-1 px-2 py-1 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-500/30 text-emerald-300 text-xs rounded-lg transition-all"
+              title="添加一个 AI 电脑"
             >
               <Bot className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">+电脑</span>
+              <span className="hidden sm:inline">+AI</span>
             </button>
           )}
 
-          {/* 房主等待阶段开局按钮 */}
           {isHost && canStart && (
             <button
               onClick={onStartHand}
-              className="flex items-center gap-1 px-3 py-1 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-black font-extrabold text-xs rounded-lg shadow-md transition-all active:scale-95 animate-pulse"
+              className="flex items-center gap-1 px-2.5 sm:px-3 py-1 bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-black font-extrabold text-xs rounded-lg shadow-md transition-all active:scale-95 animate-pulse"
             >
               <Play className="w-3.5 h-3.5 fill-black" />
               <span>发牌开局</span>
             </button>
           )}
 
-          {/* 音效开关 */}
+          <button
+            onClick={onOpenHistory}
+            className="p-1.5 text-neutral-300 hover:text-amber-300 hover:bg-white/10 rounded-lg transition-colors"
+            title="牌局动作记录"
+          >
+            <History className="w-4 h-4" />
+          </button>
+
+          <button
+            onClick={onOpenSettings}
+            className="p-1.5 text-neutral-300 hover:text-amber-300 hover:bg-white/10 rounded-lg transition-colors"
+            title="牌桌设置与皮肤"
+          >
+            <Sliders className="w-4 h-4" />
+          </button>
+
           <button
             onClick={toggleSound}
-            className="p-1.5 text-neutral-400 hover:text-white transition-colors"
+            className="hidden sm:inline-flex p-1.5 text-neutral-400 hover:text-white transition-colors"
             title={muted ? '开启声音' : '静音'}
           >
             {muted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
           </button>
 
-          {/* 规则说明 */}
           <button
             onClick={() => setShowRules(true)}
-            className="p-1.5 text-neutral-400 hover:text-white transition-colors"
+            className="hidden sm:inline-flex p-1.5 text-neutral-400 hover:text-white transition-colors"
             title="德扑牌型规则"
           >
             <HelpCircle className="w-4 h-4" />
           </button>
+
+          {/* 战绩账本与退出/解散总入口 */}
+          <button
+            onClick={onOpenSettlement}
+            className="flex items-center gap-1 px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900/70 border border-rose-500/35 text-rose-200 text-xs font-bold rounded-lg transition-all"
+            title="查看实时战绩或退出/解散房间"
+          >
+            <Trophy className="w-3.5 h-3.5 text-amber-300" />
+            <span>战绩/退出</span>
+          </button>
         </div>
       </header>
 
-      {/* 手机扫码弹窗（移出 header 以避免 backdrop-blur 截断 fixed 定位） */}
+      {/* 手机扫码弹窗 */}
       {showQr && (
         <div
           onClick={() => setShowQr(false)}
@@ -172,7 +232,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
               <img src={qrDataUrl} alt="Room QR" className="w-48 h-48" />
             </div>
             <p className="text-[11px] text-neutral-400 text-center">
-              用手机相机或微信扫一扫，免下载任何 App，即可实时联机！
+              用手机相机或微信扫一扫，无需梯子即可跨网实时联机！
             </p>
           </div>
         </div>

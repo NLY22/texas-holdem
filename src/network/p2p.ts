@@ -1,11 +1,33 @@
-import { GameAction, GameState } from '../types/poker';
+import {
+  BotPersonality,
+  GameAction,
+  GameState,
+  LedgerEntry,
+  QuickChatEvent,
+  RoomConfig,
+} from '../types/poker';
 
 const WS_BASE_URL =
   import.meta.env.VITE_WS_URL || 'wss://poker.nly22pv.dpdns.org';
 
 const CONNECT_TIMEOUT_MS = 12_000;
-const JOIN_TIMEOUT_MS = 15_000;
 const PING_INTERVAL_MS = 20_000;
+const SESSION_PREFIX = 'tx_holdem_session_';
+
+export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'closed';
+
+export interface RoomSessionInfo {
+  roomId: string;
+  peerId: string;
+  name: string;
+}
+
+export interface DissolvedInfo {
+  ledger: Record<string, LedgerEntry>;
+  roundNumber: number;
+  handNumber: number;
+  reason: string;
+}
 
 export function normalizeRoomId(raw: string): string {
   const cleaned = raw.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
@@ -22,18 +44,48 @@ export function normalizeRoomId(raw: string): string {
   return `TX-${plain}`;
 }
 
+export function getSavedSession(rawRoomId: string): RoomSessionInfo | null {
+  try {
+    const roomId = normalizeRoomId(rawRoomId);
+    if (!roomId || typeof sessionStorage === 'undefined') return null;
+    const raw = sessionStorage.getItem(SESSION_PREFIX + roomId);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveSession(info: RoomSessionInfo) {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.setItem(SESSION_PREFIX + info.roomId, JSON.stringify(info));
+  } catch {}
+}
+
+export function clearSavedSession(rawRoomId?: string) {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    if (rawRoomId) {
+      sessionStorage.removeItem(SESSION_PREFIX + normalizeRoomId(rawRoomId));
+    } else {
+      Object.keys(sessionStorage)
+        .filter(k => k.startsWith(SESSION_PREFIX))
+        .forEach(k => sessionStorage.removeItem(k));
+    }
+  } catch {}
+}
+
 export interface P2PCallbacks {
   onStateUpdate?: (state: GameState) => void;
-  onDealCards?: (cards: any[]) => void;
-  onActionReceived?: (action: GameAction) => void;
-  onPlayerJoinRequest?: (peerId: string, data: any) => void;
-  onPlayerDisconnect?: (peerId: string) => void;
-  onRebuyRequest?: (playerId: string) => void;
+  onConnectionChange?: (status: ConnectionStatus) => void;
+  onToast?: (text: string) => void;
+  onQuickChat?: (event: QuickChatEvent) => void;
+  onRoomDissolved?: (info: DissolvedInfo) => void;
+  onKicked?: (reason: string) => void;
 }
 
 export class P2PNetwork {
   public myId: string = '';
-  public isHost: boolean = false;
   public roomId: string = '';
 
   private ws: WebSocket | null = null;
@@ -48,20 +100,24 @@ export class P2PNetwork {
 
   private visibilityHandler: (() => void) | null = null;
   private onlineHandler: (() => void) | null = null;
-  private unloadHandler: (() => void) | null = null;
 
   constructor(callbacks: P2PCallbacks) {
     this.callbacks = callbacks;
   }
 
-  private buildWsUrl(mode: 'create' | 'join' | 'reattach'): string {
-    const role = this.isHost ? 'host' : 'client';
+  private emitStatus(status: ConnectionStatus) {
+    this.callbacks.onConnectionChange?.(status);
+  }
+
+  private buildWsUrl(mode: 'create' | 'join' | 'reattach', config?: Partial<RoomConfig>): string {
     const params = new URLSearchParams({
-      role,
       peerId: this.myId,
       mode,
       name: this.playerName,
     });
+    if (mode === 'create' && config) {
+      params.set('config', JSON.stringify(config));
+    }
     return `${WS_BASE_URL}/ws/${encodeURIComponent(this.roomId)}?${params.toString()}`;
   }
 
@@ -71,9 +127,7 @@ export class P2PNetwork {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         try {
           this.ws.send('PING');
-        } catch {
-          // Ignore send failure; close handler will trigger reconnect
-        }
+        } catch {}
       }
     }, PING_INTERVAL_MS);
   }
@@ -109,29 +163,11 @@ export class P2PNetwork {
         if (!this.destroyed && this.readyOnce) {
           if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             this.reconnectAttempts = 0;
-            this.scheduleReconnect(100);
+            this.scheduleReconnect(80);
           }
         }
       };
       window.addEventListener('online', this.onlineHandler);
-    }
-
-    if (typeof window !== 'undefined' && !this.unloadHandler) {
-      this.unloadHandler = () => {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN && this.myId) {
-          try {
-            this.ws.send(
-              JSON.stringify({
-                type: this.isHost ? 'HOST_CLOSE' : 'PLAYER_LEAVE',
-                playerId: this.myId,
-              })
-            );
-          } catch {
-            // Ignore errors during unload
-          }
-        }
-      };
-      window.addEventListener('beforeunload', this.unloadHandler);
     }
   }
 
@@ -142,10 +178,11 @@ export class P2PNetwork {
       this.reconnectTimer = null;
     }
 
+    this.emitStatus('reconnecting');
     const delay =
       explicitDelayMs !== undefined
         ? explicitDelayMs
-        : Math.min(1000 * Math.pow(1.6, this.reconnectAttempts), 10_000);
+        : Math.min(800 * Math.pow(1.6, this.reconnectAttempts), 10_000);
     this.reconnectAttempts += 1;
 
     this.reconnectTimer = setTimeout(() => {
@@ -164,7 +201,7 @@ export class P2PNetwork {
       const ws = new WebSocket(this.buildWsUrl('reattach'));
       this.ws = ws;
 
-      ws.onmessage = (event) => {
+      ws.onmessage = event => {
         if (typeof event.data !== 'string' || event.data === 'PONG') return;
         this.handleIncomingMessage(event.data);
       };
@@ -172,19 +209,20 @@ export class P2PNetwork {
       ws.onopen = () => {
         this.reconnectAttempts = 0;
         this.startKeepAlive();
+        this.emitStatus('connected');
       };
 
-      ws.onclose = (ev) => {
+      ws.onclose = ev => {
         this.stopKeepAlive();
         if (this.destroyed) return;
-        // 4000 / 4004 = room closed/not found intentionally
-        if (ev.code === 4000 || ev.code === 4004) return;
+        if (ev.code === 4000 || ev.code === 4004 || ev.code === 4005) {
+          this.emitStatus('closed');
+          return;
+        }
         this.scheduleReconnect();
       };
 
-      ws.onerror = () => {
-        // onclose will handle scheduling reconnect
-      };
+      ws.onerror = () => {};
     } catch {
       this.scheduleReconnect();
     }
@@ -203,35 +241,21 @@ export class P2PNetwork {
     }
   }
 
-  private sendOrQueue(payloadObj: Record<string, unknown>, coalesceBroadcast = false) {
+  private sendCommand(payloadObj: Record<string, unknown>) {
     if (this.destroyed) return;
     const raw = JSON.stringify(payloadObj);
-
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(raw);
         return;
-      } catch {
-        // Fall through to queue
-      }
-    }
-
-    if (coalesceBroadcast) {
-      this.pendingOutbound = this.pendingOutbound.filter((item) => {
-        try {
-          return JSON.parse(item).type !== 'STATE_BROADCAST';
-        } catch {
-          return true;
-        }
-      });
+      } catch {}
     }
     this.pendingOutbound.push(raw);
     if (this.pendingOutbound.length > 30) {
       this.pendingOutbound.shift();
     }
-
     if (this.readyOnce && (!this.ws || this.ws.readyState === WebSocket.CLOSED)) {
-      this.scheduleReconnect(100);
+      this.scheduleReconnect(80);
     }
   }
 
@@ -245,64 +269,89 @@ export class P2PNetwork {
 
     switch (msg.type) {
       case 'ROOM_READY':
+        this.emitStatus('connected');
         this.flushPendingOutbound();
         break;
-      case 'JOIN_REQUEST':
-        if (this.isHost) {
-          this.callbacks.onPlayerJoinRequest?.(msg.peerId, {
-            name: msg.name,
-            avatar: msg.avatar,
-          });
-        }
-        break;
       case 'STATE_UPDATE':
-        if (!this.isHost && msg.state) {
+        if (msg.state) {
           this.callbacks.onStateUpdate?.(msg.state);
         }
         break;
-      case 'DEAL_CARDS':
-        if (!this.isHost && Array.isArray(msg.cards)) {
-          this.callbacks.onDealCards?.(msg.cards);
+      case 'TOAST':
+        if (msg.text) {
+          this.callbacks.onToast?.(msg.text);
         }
         break;
-      case 'PLAYER_ACTION':
-        if (this.isHost && msg.action) {
-          this.callbacks.onActionReceived?.(msg.action);
+      case 'QUICK_CHAT':
+        if (msg.event) {
+          this.callbacks.onQuickChat?.(msg.event);
         }
         break;
-      case 'REBUY_REQUEST':
-        if (this.isHost && msg.playerId) {
-          this.callbacks.onRebuyRequest?.(msg.playerId);
-        }
+      case 'ROOM_DISSOLVED':
+        this.destroyed = true;
+        clearSavedSession(this.roomId);
+        this.emitStatus('closed');
+        this.callbacks.onRoomDissolved?.({
+          ledger: msg.ledger || {},
+          roundNumber: msg.roundNumber || 1,
+          handNumber: msg.handNumber || 0,
+          reason: msg.error || '房主已解散房间',
+        });
         break;
-      case 'PLAYER_DISCONNECT':
-        if (this.isHost && msg.peerId) {
-          this.callbacks.onPlayerDisconnect?.(msg.peerId);
-        }
+      case 'KICKED':
+        this.destroyed = true;
+        clearSavedSession(this.roomId);
+        this.emitStatus('closed');
+        this.callbacks.onKicked?.(msg.error || '您已被房主请离房间');
         break;
       default:
         break;
     }
   }
 
-  async createRoom(rawRoomId: string): Promise<string> {
+  private connectInitial(
+    rawRoomId: string,
+    playerName: string,
+    mode: 'create' | 'join' | 'reattach',
+    existingPeerId?: string,
+    config?: Partial<RoomConfig>
+  ): Promise<GameState> {
     const roomId = normalizeRoomId(rawRoomId);
     if (!roomId) {
-      throw new Error('请输入有效的房间号');
+      return Promise.reject(new Error('请输入有效的 4 位房间号'));
     }
 
     this.roomId = roomId;
-    this.isHost = true;
+    this.playerName = playerName || '玩家';
     this.destroyed = false;
-    this.myId = 'host-' + Math.random().toString(36).slice(2, 10);
+    this.myId = existingPeerId || 'p-' + Math.random().toString(36).slice(2, 10);
+    this.emitStatus('connecting');
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      let latestState: GameState | null = null;
+      let roomReady = false;
+
       const fail = (errMsg: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        this.emitStatus('closed');
         reject(new Error(errMsg));
+      };
+
+      const maybeResolve = () => {
+        if (!settled && roomReady && latestState) {
+          settled = true;
+          clearTimeout(timer);
+          this.readyOnce = true;
+          this.reconnectAttempts = 0;
+          saveSession({ roomId: this.roomId, peerId: this.myId, name: this.playerName });
+          this.startKeepAlive();
+          this.setupLifecycleListeners();
+          this.emitStatus('connected');
+          resolve(latestState);
+        }
       };
 
       const timer = setTimeout(() => {
@@ -314,7 +363,7 @@ export class P2PNetwork {
 
       let ws: WebSocket;
       try {
-        ws = new WebSocket(this.buildWsUrl('create'));
+        ws = new WebSocket(this.buildWsUrl(mode, config));
         this.ws = ws;
       } catch {
         clearTimeout(timer);
@@ -322,7 +371,7 @@ export class P2PNetwork {
         return;
       }
 
-      ws.onmessage = (event) => {
+      ws.onmessage = event => {
         if (typeof event.data !== 'string' || event.data === 'PONG') return;
         let msg: any;
         try {
@@ -332,18 +381,21 @@ export class P2PNetwork {
         }
 
         if (!settled && msg.type === 'ROOM_ERROR') {
-          fail(msg.error || '创建房间失败');
+          if (mode === 'reattach') clearSavedSession(this.roomId);
+          fail(msg.error || '加入房间失败');
           return;
         }
 
         if (!settled && msg.type === 'ROOM_READY') {
-          settled = true;
-          clearTimeout(timer);
-          this.readyOnce = true;
-          this.reconnectAttempts = 0;
-          this.startKeepAlive();
-          this.setupLifecycleListeners();
-          resolve(this.roomId);
+          roomReady = true;
+          maybeResolve();
+          return;
+        }
+
+        if (!settled && msg.type === 'STATE_UPDATE' && msg.state) {
+          latestState = msg.state;
+          this.callbacks.onStateUpdate?.(msg.state);
+          maybeResolve();
           return;
         }
 
@@ -356,204 +408,124 @@ export class P2PNetwork {
         }
       };
 
-      ws.onclose = (ev) => {
+      ws.onclose = ev => {
         this.stopKeepAlive();
         if (!settled) {
-          fail(ev.code === 4001 ? '该房间号正在使用中，请重试' : '与联机服务器断开连接');
+          if (ev.code === 4001) fail('该房间号正在使用中，请重试');
+          else if (ev.code === 4003) fail('房间已满 (最多 6 人)');
+          else if (ev.code === 4004) fail('房间不存在或已解散');
+          else fail('与联机服务器断开连接');
           return;
         }
-        if (!this.destroyed && ev.code !== 4000) {
+        if (!this.destroyed && ev.code !== 4000 && ev.code !== 4004 && ev.code !== 4005) {
           this.scheduleReconnect();
         }
       };
     });
   }
 
-  async joinRoom(rawRoomId: string, playerName: string, avatar: string): Promise<void> {
-    const roomId = normalizeRoomId(rawRoomId);
-    if (!roomId) {
-      throw new Error('请输入有效的 4 位房间号');
-    }
+  async createRoom(rawRoomId: string, playerName: string, config?: Partial<RoomConfig>): Promise<GameState> {
+    return this.connectInitial(rawRoomId, playerName, 'create', undefined, config);
+  }
 
-    this.roomId = roomId;
-    this.isHost = false;
-    this.destroyed = false;
-    this.playerName = playerName || '玩家';
-    this.myId = 'player-' + Math.random().toString(36).slice(2, 10);
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const fail = (errMsg: string) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(new Error(errMsg));
-      };
-
-      const timer = setTimeout(() => {
-        try {
-          this.ws?.close();
-        } catch {}
-        fail('加入房间超时：请确认房间号正确，且房主手机停留在牌桌页面');
-      }, JOIN_TIMEOUT_MS);
-
-      let ws: WebSocket;
+  async joinRoom(rawRoomId: string, playerName: string): Promise<GameState> {
+    const saved = getSavedSession(rawRoomId);
+    if (saved) {
       try {
-        ws = new WebSocket(this.buildWsUrl('join'));
-        this.ws = ws;
+        return await this.connectInitial(rawRoomId, saved.name || playerName, 'reattach', saved.peerId);
       } catch {
-        clearTimeout(timer);
-        reject(new Error('无法创建 WebSocket 连接'));
-        return;
+        clearSavedSession(rawRoomId);
       }
-
-      ws.onmessage = (event) => {
-        if (typeof event.data !== 'string' || event.data === 'PONG') return;
-        let msg: any;
-        try {
-          msg = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-
-        if (!settled && msg.type === 'ROOM_ERROR') {
-          fail(msg.error || '房间不存在或已关闭');
-          return;
-        }
-
-        if (!settled && msg.type === 'ROOM_READY') {
-          ws.send(
-            JSON.stringify({
-              type: 'JOIN_REQUEST',
-              name: this.playerName,
-              avatar,
-            })
-          );
-          return;
-        }
-
-        if (!settled && msg.type === 'JOIN_RESPONSE') {
-          if (msg.success) {
-            settled = true;
-            clearTimeout(timer);
-            this.readyOnce = true;
-            this.reconnectAttempts = 0;
-            this.startKeepAlive();
-            this.setupLifecycleListeners();
-            if (msg.state) {
-              this.callbacks.onStateUpdate?.(msg.state);
-            }
-            resolve();
-          } else {
-            fail(msg.error || '加入房间失败');
-            try {
-              ws.close(1000, 'JOIN_REJECTED');
-            } catch {}
-          }
-          return;
-        }
-
-        this.handleIncomingMessage(event.data);
-      };
-
-      ws.onerror = () => {
-        if (!settled) {
-          fail('无法连接到联机服务器，请检查网络后重试');
-        }
-      };
-
-      ws.onclose = (ev) => {
-        this.stopKeepAlive();
-        if (!settled) {
-          fail(ev.code === 4004 ? '房间不存在，请核对房间号或让房主先创建房间' : '连接已断开，请重试');
-          return;
-        }
-        if (!this.destroyed && ev.code !== 4000 && ev.code !== 4004) {
-          this.scheduleReconnect();
-        }
-      };
-    });
+    }
+    return this.connectInitial(rawRoomId, playerName, 'join');
   }
 
-  sendJoinResponse(peerId: string, success: boolean, state?: GameState, error?: string) {
-    if (!this.isHost) return;
-    this.sendOrQueue({
-      type: 'JOIN_RESPONSE',
-      peerId,
-      success,
-      state,
-      error,
-    });
+  async reattachRoom(session: RoomSessionInfo): Promise<GameState> {
+    return this.connectInitial(session.roomId, session.name, 'reattach', session.peerId);
   }
 
-  broadcastState(state: GameState) {
-    if (!this.isHost) return;
-    this.sendOrQueue(
-      {
-        type: 'STATE_BROADCAST',
-        state,
-      },
-      true
-    );
-  }
-
-  sendPrivateCards(peerId: string, cards: any[]) {
-    if (!this.isHost) return;
-    this.sendOrQueue({
-      type: 'DEAL_CARDS',
-      peerId,
-      cards,
-    });
-  }
-
+  // 全部权威操作指令
   sendAction(action: GameAction) {
-    this.sendOrQueue({
-      type: 'PLAYER_ACTION',
-      action,
-    });
+    this.sendCommand({ type: 'PLAYER_ACTION', action });
+  }
+  startHand() {
+    this.sendCommand({ type: 'START_HAND' });
+  }
+  addBot(seatIndex?: number, personality?: BotPersonality) {
+    this.sendCommand({ type: 'ADD_BOT', seatIndex, personality });
+  }
+  removeBot(seatIndex: number) {
+    this.sendCommand({ type: 'REMOVE_BOT', seatIndex });
+  }
+  clearBots() {
+    this.sendCommand({ type: 'CLEAR_BOTS' });
+  }
+  sitAtSeat(seatIndex: number) {
+    this.sendCommand({ type: 'SIT_AT_SEAT', seatIndex });
+  }
+  toggleSitOut() {
+    this.sendCommand({ type: 'TOGGLE_SIT_OUT' });
+  }
+  sendRebuyRequest(mode: 'rebuy' | 'topup' = 'rebuy') {
+    this.sendCommand({ type: 'REBUY_REQUEST', mode });
+  }
+  updateConfig(config: Partial<RoomConfig>) {
+    this.sendCommand({ type: 'UPDATE_CONFIG', config });
+  }
+  kickPlayer(seatIndex: number) {
+    this.sendCommand({ type: 'KICK_PLAYER', seatIndex });
+  }
+  transferHost(targetPlayerId: string) {
+    this.sendCommand({ type: 'TRANSFER_HOST', targetPlayerId });
+  }
+  showWinnerCards() {
+    this.sendCommand({ type: 'SHOW_WINNER_CARDS' });
+  }
+  rabbitHunt() {
+    this.sendCommand({ type: 'RABBIT_HUNT' });
+  }
+  sendQuickChat(text: string) {
+    this.sendCommand({ type: 'QUICK_CHAT', text });
+  }
+  resetTable() {
+    this.sendCommand({ type: 'RESET_TABLE' });
+  }
+  dissolveRoom() {
+    clearSavedSession(this.roomId);
+    this.sendCommand({ type: 'DISSOLVE_ROOM' });
+  }
+  leaveRoom() {
+    clearSavedSession(this.roomId);
+    this.destroyed = true;
+    this.stopKeepAlive();
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify({ type: 'PLAYER_LEAVE' }));
+      } catch {}
+    }
+    this.cleanupListeners();
   }
 
-  sendRebuyRequest(playerId: string) {
-    this.sendOrQueue({
-      type: 'REBUY_REQUEST',
-      playerId,
-    });
+  private cleanupListeners() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (typeof document !== 'undefined' && this.visibilityHandler) {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
+    if (typeof window !== 'undefined' && this.onlineHandler) {
+      window.removeEventListener('online', this.onlineHandler);
+      this.onlineHandler = null;
+    }
   }
 
   destroy() {
     this.destroyed = true;
     this.stopKeepAlive();
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
-    if (typeof document !== 'undefined' && this.visibilityHandler) {
-      document.removeEventListener('visibilitychange', this.visibilityHandler);
-      this.visibilityHandler = null;
-    }
-    if (typeof window !== 'undefined') {
-      if (this.onlineHandler) {
-        window.removeEventListener('online', this.onlineHandler);
-        this.onlineHandler = null;
-      }
-      if (this.unloadHandler) {
-        window.removeEventListener('beforeunload', this.unloadHandler);
-        this.unloadHandler = null;
-      }
-    }
-
+    this.cleanupListeners();
     if (this.ws) {
-      if (this.ws.readyState === WebSocket.OPEN && this.myId) {
-        try {
-          this.ws.send(
-            JSON.stringify({
-              type: this.isHost ? 'HOST_CLOSE' : 'PLAYER_LEAVE',
-              playerId: this.myId,
-            })
-          );
-        } catch {}
-      }
       try {
         this.ws.close(1000, 'DESTROY');
       } catch {}
