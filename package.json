@@ -11,8 +11,6 @@
   "dependencies": {
     "canvas-confetti": "^1.9.4",
     "lucide-react": "^1.79.0",
-    "mqtt": "^5.16.1",
-    "peerjs": "^1.5.5",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

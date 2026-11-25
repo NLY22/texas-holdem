@@ -1,412 +1,564 @@
-import mqtt, { MqttClient } from 'mqtt';
-import { GameAction, GameState, P2PMessage } from '../types/poker';
+import { GameAction, GameState } from '../types/poker';
 
-const BROKERS = [
-  'wss://broker.emqx.io:8084/mqtt',
-  'wss://broker.hivemq.com:8884/mqtt',
-];
+const WS_BASE_URL =
+  import.meta.env.VITE_WS_URL || 'wss://poker.nly22pv.dpdns.org';
 
-/**
- * 规范化房间号：支持用户输入 "8821"、"tx-8821"、"tx8821" 或完整邀请 URL
- */
+const CONNECT_TIMEOUT_MS = 12_000;
+const JOIN_TIMEOUT_MS = 15_000;
+const PING_INTERVAL_MS = 20_000;
+
 export function normalizeRoomId(raw: string): string {
-  let clean = raw.trim();
-  const urlMatch = clean.match(/[?&]room=([^&]+)/i);
-  if (urlMatch && urlMatch[1]) {
-    clean = decodeURIComponent(urlMatch[1]).trim();
+  const cleaned = raw.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+  if (!cleaned) return '';
+  if (cleaned.startsWith('TX-')) {
+    const code = cleaned.slice(3).replace(/[^A-Z0-9]/g, '');
+    return code ? `TX-${code}` : '';
   }
-  clean = clean.toUpperCase();
-  if (/^\d{4}$/.test(clean)) {
-    return `TX-${clean}`;
+  const plain = cleaned.replace(/-/g, '');
+  if (!plain) return '';
+  if (plain.startsWith('TX') && plain.length > 2) {
+    return `TX-${plain.slice(2)}`;
   }
-  if (/^TX(\d{4})$/.test(clean)) {
-    return `TX-${clean.slice(2)}`;
-  }
-  return clean;
+  return `TX-${plain}`;
+}
+
+export interface P2PCallbacks {
+  onStateUpdate?: (state: GameState) => void;
+  onDealCards?: (cards: any[]) => void;
+  onActionReceived?: (action: GameAction) => void;
+  onPlayerJoinRequest?: (peerId: string, data: any) => void;
+  onPlayerDisconnect?: (peerId: string) => void;
+  onRebuyRequest?: (playerId: string) => void;
 }
 
 export class P2PNetwork {
-  private client: MqttClient | null = null;
-  private connectedClients: Set<string> = new Set();
-  private topicPrefix: string = '';
-  private visibilityHandler?: () => void;
-  private unloadHandler?: () => void;
-
   public myId: string = '';
   public isHost: boolean = false;
+  public roomId: string = '';
 
-  private onStateUpdateCb?: (state: GameState) => void;
-  private onDealCardsCb?: (cards: any[]) => void;
-  private onActionReceivedCb?: (action: GameAction) => void;
-  private onPlayerJoinRequestCb?: (peerId: string, data: any) => void;
-  private onPlayerDisconnectCb?: (peerId: string) => void;
-  private onRebuyRequestCb?: (playerId: string) => void;
+  private ws: WebSocket | null = null;
+  private callbacks: P2PCallbacks;
+  private playerName: string = '玩家';
+  private destroyed: boolean = false;
+  private readyOnce: boolean = false;
+  private reconnectAttempts: number = 0;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingOutbound: string[] = [];
 
-  constructor(
-    callbacks: {
-      onStateUpdate?: (state: GameState) => void;
-      onDealCards?: (cards: any[]) => void;
-      onActionReceived?: (action: GameAction) => void;
-      onPlayerJoinRequest?: (peerId: string, data: any) => void;
-      onPlayerDisconnect?: (peerId: string) => void;
-      onRebuyRequest?: (playerId: string) => void;
-    }
-  ) {
-    this.onStateUpdateCb = callbacks.onStateUpdate;
-    this.onDealCardsCb = callbacks.onDealCards;
-    this.onActionReceivedCb = callbacks.onActionReceived;
-    this.onPlayerJoinRequestCb = callbacks.onPlayerJoinRequest;
-    this.onPlayerDisconnectCb = callbacks.onPlayerDisconnect;
-    this.onRebuyRequestCb = callbacks.onRebuyRequest;
+  private visibilityHandler: (() => void) | null = null;
+  private onlineHandler: (() => void) | null = null;
+  private unloadHandler: (() => void) | null = null;
+
+  constructor(callbacks: P2PCallbacks) {
+    this.callbacks = callbacks;
   }
 
-  private connectWithFallback(
-    optionsFactory: (brokerUrl: string) => { url: string; opts: mqtt.IClientOptions }
-  ): Promise<MqttClient> {
-    return new Promise((resolve, reject) => {
-      let currentIdx = 0;
-      let resolved = false;
-
-      const tryNext = () => {
-        if (currentIdx >= BROKERS.length) {
-          if (!resolved) {
-            resolved = true;
-            reject(new Error('无法连接到联机服务器，请检查手机网络后重试'));
-          }
-          return;
-        }
-
-        const brokerUrl = BROKERS[currentIdx++];
-        const { url, opts } = optionsFactory(brokerUrl);
-        const client = mqtt.connect(url, opts);
-
-        const connectTimer = setTimeout(() => {
-          if (!resolved && !client.connected) {
-            client.end(true);
-            tryNext();
-          }
-        }, 5000);
-
-        client.on('connect', () => {
-          clearTimeout(connectTimer);
-          if (!resolved) {
-            resolved = true;
-            resolve(client);
-          }
-        });
-
-        client.on('error', err => {
-          console.warn('MQTT 连接异常:', brokerUrl, err.message);
-          if (!resolved) {
-            clearTimeout(connectTimer);
-            client.end(true);
-            tryNext();
-          }
-        });
-      };
-
-      tryNext();
+  private buildWsUrl(mode: 'create' | 'join' | 'reattach'): string {
+    const role = this.isHost ? 'host' : 'client';
+    const params = new URLSearchParams({
+      role,
+      peerId: this.myId,
+      mode,
+      name: this.playerName,
     });
+    return `${WS_BASE_URL}/ws/${encodeURIComponent(this.roomId)}?${params.toString()}`;
   }
 
-  private attachMobileLifecycleHooks() {
-    if (typeof document !== 'undefined') {
+  private startKeepAlive() {
+    this.stopKeepAlive();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send('PING');
+        } catch {
+          // Ignore send failure; close handler will trigger reconnect
+        }
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  private stopKeepAlive() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  private setupLifecycleListeners() {
+    if (typeof document !== 'undefined' && !this.visibilityHandler) {
       this.visibilityHandler = () => {
-        if (document.visibilityState === 'visible' && this.client && !this.client.connected) {
-          console.log('页面切回前台，自动恢复房间连接...');
-          this.client.reconnect();
+        if (document.visibilityState === 'visible' && !this.destroyed && this.readyOnce) {
+          if (!this.ws || this.ws.readyState === WebSocket.CLOSED || this.ws.readyState === WebSocket.CLOSING) {
+            this.reconnectAttempts = 0;
+            this.scheduleReconnect(50);
+          } else if (this.ws.readyState === WebSocket.OPEN) {
+            try {
+              this.ws.send('PING');
+            } catch {
+              this.scheduleReconnect(50);
+            }
+          }
         }
       };
       document.addEventListener('visibilitychange', this.visibilityHandler);
     }
 
-    if (typeof window !== 'undefined' && !this.isHost) {
-      this.unloadHandler = () => {
-        if (this.client && this.client.connected && this.myId) {
-          this.client.publish(
-            `${this.topicPrefix}/to/host`,
-            JSON.stringify({ type: 'PLAYER_LEAVE', playerId: this.myId })
-          );
+    if (typeof window !== 'undefined' && !this.onlineHandler) {
+      this.onlineHandler = () => {
+        if (!this.destroyed && this.readyOnce) {
+          if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            this.reconnectAttempts = 0;
+            this.scheduleReconnect(100);
+          }
         }
       };
-      window.addEventListener('pagehide', this.unloadHandler);
+      window.addEventListener('online', this.onlineHandler);
+    }
+
+    if (typeof window !== 'undefined' && !this.unloadHandler) {
+      this.unloadHandler = () => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN && this.myId) {
+          try {
+            this.ws.send(
+              JSON.stringify({
+                type: this.isHost ? 'HOST_CLOSE' : 'PLAYER_LEAVE',
+                playerId: this.myId,
+              })
+            );
+          } catch {
+            // Ignore errors during unload
+          }
+        }
+      };
       window.addEventListener('beforeunload', this.unloadHandler);
     }
   }
 
-  // 1. 作为房主创建房间
-  async createRoom(rawRoomId: string): Promise<string> {
-    const roomId = normalizeRoomId(rawRoomId);
-    this.isHost = true;
-    this.myId = 'host-' + Math.random().toString(36).substring(2, 8);
-    this.topicPrefix = `txholdem/v2/${roomId}`;
+  private scheduleReconnect(explicitDelayMs?: number) {
+    if (this.destroyed || !this.readyOnce) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
-    const client = await this.connectWithFallback(url => ({
-      url,
-      opts: {
-        clientId: `txh_${this.myId}_${Date.now()}`,
-        clean: true,
-        connectTimeout: 5000,
-        keepalive: 20,
-        reconnectPeriod: 1500,
-      },
-    }));
+    const delay =
+      explicitDelayMs !== undefined
+        ? explicitDelayMs
+        : Math.min(1000 * Math.pow(1.6, this.reconnectAttempts), 10_000);
+    this.reconnectAttempts += 1;
 
-    this.client = client;
-    this.attachMobileLifecycleHooks();
-
-    await new Promise<void>((resolve, reject) => {
-      client.subscribe(`${this.topicPrefix}/to/host`, { qos: 1 }, err => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-
-    client.on('message', (_topic, payload) => {
-      try {
-        const msg = JSON.parse(payload.toString()) as P2PMessage;
-        this.handleHostMessage(msg);
-      } catch (e) {
-        console.error('解析消息失败:', e);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.destroyed) return;
+      if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+        return;
       }
-    });
-
-    console.log('房主房间初始化成功，房间:', roomId, 'HostID:', this.myId);
-    return this.myId;
+      this.openReattachSocket();
+    }, delay);
   }
 
-  private handleHostMessage(msg: P2PMessage) {
+  private openReattachSocket() {
+    if (this.destroyed) return;
+    try {
+      const ws = new WebSocket(this.buildWsUrl('reattach'));
+      this.ws = ws;
+
+      ws.onmessage = (event) => {
+        if (typeof event.data !== 'string' || event.data === 'PONG') return;
+        this.handleIncomingMessage(event.data);
+      };
+
+      ws.onopen = () => {
+        this.reconnectAttempts = 0;
+        this.startKeepAlive();
+      };
+
+      ws.onclose = (ev) => {
+        this.stopKeepAlive();
+        if (this.destroyed) return;
+        // 4000 / 4004 = room closed/not found intentionally
+        if (ev.code === 4000 || ev.code === 4004) return;
+        this.scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        // onclose will handle scheduling reconnect
+      };
+    } catch {
+      this.scheduleReconnect();
+    }
+  }
+
+  private flushPendingOutbound() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    while (this.pendingOutbound.length > 0) {
+      const payload = this.pendingOutbound.shift()!;
+      try {
+        this.ws.send(payload);
+      } catch {
+        this.pendingOutbound.unshift(payload);
+        break;
+      }
+    }
+  }
+
+  private sendOrQueue(payloadObj: Record<string, unknown>, coalesceBroadcast = false) {
+    if (this.destroyed) return;
+    const raw = JSON.stringify(payloadObj);
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(raw);
+        return;
+      } catch {
+        // Fall through to queue
+      }
+    }
+
+    if (coalesceBroadcast) {
+      this.pendingOutbound = this.pendingOutbound.filter((item) => {
+        try {
+          return JSON.parse(item).type !== 'STATE_BROADCAST';
+        } catch {
+          return true;
+        }
+      });
+    }
+    this.pendingOutbound.push(raw);
+    if (this.pendingOutbound.length > 30) {
+      this.pendingOutbound.shift();
+    }
+
+    if (this.readyOnce && (!this.ws || this.ws.readyState === WebSocket.CLOSED)) {
+      this.scheduleReconnect(100);
+    }
+  }
+
+  private handleIncomingMessage(raw: string) {
+    let msg: any;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
     switch (msg.type) {
+      case 'ROOM_READY':
+        this.flushPendingOutbound();
+        break;
       case 'JOIN_REQUEST':
-        if (msg.senderId) {
-          this.connectedClients.add(msg.senderId);
-          this.onPlayerJoinRequestCb?.(msg.senderId, msg);
+        if (this.isHost) {
+          this.callbacks.onPlayerJoinRequest?.(msg.peerId, {
+            name: msg.name,
+            avatar: msg.avatar,
+          });
         }
         break;
-
+      case 'STATE_UPDATE':
+        if (!this.isHost && msg.state) {
+          this.callbacks.onStateUpdate?.(msg.state);
+        }
+        break;
+      case 'DEAL_CARDS':
+        if (!this.isHost && Array.isArray(msg.cards)) {
+          this.callbacks.onDealCards?.(msg.cards);
+        }
+        break;
       case 'PLAYER_ACTION':
-        this.onActionReceivedCb?.(msg.action);
-        break;
-
-      case 'REBUY_REQUEST':
-        this.onRebuyRequestCb?.(msg.playerId);
-        break;
-
-      case 'PLAYER_LEAVE':
-        if (this.connectedClients.has(msg.playerId)) {
-          this.connectedClients.delete(msg.playerId);
-          this.onPlayerDisconnectCb?.(msg.playerId);
+        if (this.isHost && msg.action) {
+          this.callbacks.onActionReceived?.(msg.action);
         }
+        break;
+      case 'REBUY_REQUEST':
+        if (this.isHost && msg.playerId) {
+          this.callbacks.onRebuyRequest?.(msg.playerId);
+        }
+        break;
+      case 'PLAYER_DISCONNECT':
+        if (this.isHost && msg.peerId) {
+          this.callbacks.onPlayerDisconnect?.(msg.peerId);
+        }
+        break;
+      default:
         break;
     }
   }
 
-  // 2. 作为玩家加入房间 (内置重发机制，防止房主切微信发链接时短暂掉线漏包)
-  async joinRoom(rawRoomId: string, playerName: string, avatar: string): Promise<void> {
+  async createRoom(rawRoomId: string): Promise<string> {
     const roomId = normalizeRoomId(rawRoomId);
     if (!roomId) {
       throw new Error('请输入有效的房间号');
     }
 
-    this.isHost = false;
-    this.myId = 'p-' + Math.random().toString(36).substring(2, 10);
-    this.topicPrefix = `txholdem/v2/${roomId}`;
+    this.roomId = roomId;
+    this.isHost = true;
+    this.destroyed = false;
+    this.myId = 'host-' + Math.random().toString(36).slice(2, 10);
 
-    const client = await this.connectWithFallback(url => ({
-      url,
-      opts: {
-        clientId: `txc_${this.myId}_${Date.now()}`,
-        clean: true,
-        connectTimeout: 5000,
-        keepalive: 20,
-        reconnectPeriod: 1500,
-        will: {
-          topic: `${this.topicPrefix}/to/host`,
-          payload: JSON.stringify({ type: 'PLAYER_LEAVE', playerId: this.myId }),
-          qos: 1,
-          retain: false,
-        },
-      },
-    }));
-
-    this.client = client;
-    this.attachMobileLifecycleHooks();
-
-    await new Promise<void>((resolve, reject) => {
-      client.subscribe(`${this.topicPrefix}/to/${this.myId}`, { qos: 1 }, err => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-
-    return new Promise<void>((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       let settled = false;
-      let retryTimer: any = null;
-      let timeoutTimer: any = null;
-
-      const cleanupTimers = () => {
-        if (retryTimer) clearInterval(retryTimer);
-        if (timeoutTimer) clearTimeout(timeoutTimer);
+      const fail = (errMsg: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(errMsg));
       };
 
-      client.on('message', (_topic, payload) => {
+      const timer = setTimeout(() => {
         try {
-          const msg = JSON.parse(payload.toString()) as P2PMessage;
-          switch (msg.type) {
-            case 'JOIN_RESPONSE':
-              if (!settled) {
-                settled = true;
-                cleanupTimers();
-                if (msg.success) {
-                  if (msg.state) this.onStateUpdateCb?.(msg.state);
-                  resolve();
-                } else {
-                  this.destroy();
-                  reject(new Error(msg.error || '加入房间失败'));
-                }
-              }
-              break;
+          this.ws?.close();
+        } catch {}
+        fail('连接联机服务器超时，请检查网络后重试');
+      }, CONNECT_TIMEOUT_MS);
 
-            case 'STATE_UPDATE':
-              this.onStateUpdateCb?.(msg.state);
-              break;
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(this.buildWsUrl('create'));
+        this.ws = ws;
+      } catch {
+        clearTimeout(timer);
+        reject(new Error('无法创建 WebSocket 连接'));
+        return;
+      }
 
-            case 'DEAL_CARDS':
-              this.onDealCardsCb?.(msg.cards);
-              break;
-          }
-        } catch (e) {
-          console.error('解析客户端消息失败:', e);
+      ws.onmessage = (event) => {
+        if (typeof event.data !== 'string' || event.data === 'PONG') return;
+        let msg: any;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return;
         }
-      });
 
-      const sendJoin = () => {
-        if (!client.connected) return;
-        client.publish(
-          `${this.topicPrefix}/to/host`,
-          JSON.stringify({
-            type: 'JOIN_REQUEST',
-            senderId: this.myId,
-            name: playerName,
-            avatar,
-          }),
-          { qos: 1 }
-        );
+        if (!settled && msg.type === 'ROOM_ERROR') {
+          fail(msg.error || '创建房间失败');
+          return;
+        }
+
+        if (!settled && msg.type === 'ROOM_READY') {
+          settled = true;
+          clearTimeout(timer);
+          this.readyOnce = true;
+          this.reconnectAttempts = 0;
+          this.startKeepAlive();
+          this.setupLifecycleListeners();
+          resolve(this.roomId);
+          return;
+        }
+
+        this.handleIncomingMessage(event.data);
       };
 
-      // 立即发送一次，若房主切到后台刚恢复，每 1.5 秒自动补发一次
-      sendJoin();
-      retryTimer = setInterval(sendJoin, 1500);
-
-      timeoutTimer = setTimeout(() => {
+      ws.onerror = () => {
         if (!settled) {
-          settled = true;
-          cleanupTimers();
-          this.destroy();
-          reject(new Error(`未找到房间 ${roomId}，请核对房间号并确认房主页面处于打开状态`));
+          fail('无法连接到联机服务器，请稍后重试');
         }
-      }, 9000);
+      };
+
+      ws.onclose = (ev) => {
+        this.stopKeepAlive();
+        if (!settled) {
+          fail(ev.code === 4001 ? '该房间号正在使用中，请重试' : '与联机服务器断开连接');
+          return;
+        }
+        if (!this.destroyed && ev.code !== 4000) {
+          this.scheduleReconnect();
+        }
+      };
+    });
+  }
+
+  async joinRoom(rawRoomId: string, playerName: string, avatar: string): Promise<void> {
+    const roomId = normalizeRoomId(rawRoomId);
+    if (!roomId) {
+      throw new Error('请输入有效的 4 位房间号');
+    }
+
+    this.roomId = roomId;
+    this.isHost = false;
+    this.destroyed = false;
+    this.playerName = playerName || '玩家';
+    this.myId = 'player-' + Math.random().toString(36).slice(2, 10);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = (errMsg: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(errMsg));
+      };
+
+      const timer = setTimeout(() => {
+        try {
+          this.ws?.close();
+        } catch {}
+        fail('加入房间超时：请确认房间号正确，且房主手机停留在牌桌页面');
+      }, JOIN_TIMEOUT_MS);
+
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(this.buildWsUrl('join'));
+        this.ws = ws;
+      } catch {
+        clearTimeout(timer);
+        reject(new Error('无法创建 WebSocket 连接'));
+        return;
+      }
+
+      ws.onmessage = (event) => {
+        if (typeof event.data !== 'string' || event.data === 'PONG') return;
+        let msg: any;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (!settled && msg.type === 'ROOM_ERROR') {
+          fail(msg.error || '房间不存在或已关闭');
+          return;
+        }
+
+        if (!settled && msg.type === 'ROOM_READY') {
+          ws.send(
+            JSON.stringify({
+              type: 'JOIN_REQUEST',
+              name: this.playerName,
+              avatar,
+            })
+          );
+          return;
+        }
+
+        if (!settled && msg.type === 'JOIN_RESPONSE') {
+          if (msg.success) {
+            settled = true;
+            clearTimeout(timer);
+            this.readyOnce = true;
+            this.reconnectAttempts = 0;
+            this.startKeepAlive();
+            this.setupLifecycleListeners();
+            if (msg.state) {
+              this.callbacks.onStateUpdate?.(msg.state);
+            }
+            resolve();
+          } else {
+            fail(msg.error || '加入房间失败');
+            try {
+              ws.close(1000, 'JOIN_REJECTED');
+            } catch {}
+          }
+          return;
+        }
+
+        this.handleIncomingMessage(event.data);
+      };
+
+      ws.onerror = () => {
+        if (!settled) {
+          fail('无法连接到联机服务器，请检查网络后重试');
+        }
+      };
+
+      ws.onclose = (ev) => {
+        this.stopKeepAlive();
+        if (!settled) {
+          fail(ev.code === 4004 ? '房间不存在，请核对房间号或让房主先创建房间' : '连接已断开，请重试');
+          return;
+        }
+        if (!this.destroyed && ev.code !== 4000 && ev.code !== 4004) {
+          this.scheduleReconnect();
+        }
+      };
     });
   }
 
   sendJoinResponse(peerId: string, success: boolean, state?: GameState, error?: string) {
-    if (!this.client || !this.client.connected) return;
-    const maskedState = state ? this.maskStateForPeer(state, peerId) : undefined;
-    this.client.publish(
-      `${this.topicPrefix}/to/${peerId}`,
-      JSON.stringify({
-        type: 'JOIN_RESPONSE',
-        success,
-        state: maskedState,
-        error,
-      }),
-      { qos: 1 }
-    );
-  }
-
-  private maskStateForPeer(state: GameState, peerId: string): GameState {
-    const maskedPlayers = state.players.map(p => {
-      if (!p) return null;
-      if (p.id === peerId || p.showCards) {
-        return p;
-      }
-      return {
-        ...p,
-        holeCards: p.holeCards.map(() => ({ suit: 'spades' as const, rank: 0 })),
-      };
+    if (!this.isHost) return;
+    this.sendOrQueue({
+      type: 'JOIN_RESPONSE',
+      peerId,
+      success,
+      state,
+      error,
     });
-    return { ...state, players: maskedPlayers };
   }
 
   broadcastState(state: GameState) {
-    if (!this.isHost || !this.client || !this.client.connected) return;
-
-    this.connectedClients.forEach(peerId => {
-      this.client!.publish(
-        `${this.topicPrefix}/to/${peerId}`,
-        JSON.stringify({
-          type: 'STATE_UPDATE',
-          state: this.maskStateForPeer(state, peerId),
-        }),
-        { qos: 1 }
-      );
-    });
+    if (!this.isHost) return;
+    this.sendOrQueue(
+      {
+        type: 'STATE_BROADCAST',
+        state,
+      },
+      true
+    );
   }
 
   sendPrivateCards(peerId: string, cards: any[]) {
-    if (!this.client || !this.client.connected) return;
-    this.client.publish(
-      `${this.topicPrefix}/to/${peerId}`,
-      JSON.stringify({
-        type: 'DEAL_CARDS',
-        cards,
-      }),
-      { qos: 1 }
-    );
+    if (!this.isHost) return;
+    this.sendOrQueue({
+      type: 'DEAL_CARDS',
+      peerId,
+      cards,
+    });
   }
 
   sendAction(action: GameAction) {
-    if (!this.client || !this.client.connected) return;
-    this.client.publish(
-      `${this.topicPrefix}/to/host`,
-      JSON.stringify({
-        type: 'PLAYER_ACTION',
-        action,
-      }),
-      { qos: 1 }
-    );
+    this.sendOrQueue({
+      type: 'PLAYER_ACTION',
+      action,
+    });
   }
 
   sendRebuyRequest(playerId: string) {
-    if (!this.client || !this.client.connected) return;
-    this.client.publish(
-      `${this.topicPrefix}/to/host`,
-      JSON.stringify({
-        type: 'REBUY_REQUEST',
-        playerId,
-      }),
-      { qos: 1 }
-    );
+    this.sendOrQueue({
+      type: 'REBUY_REQUEST',
+      playerId,
+    });
   }
 
   destroy() {
+    this.destroyed = true;
+    this.stopKeepAlive();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     if (typeof document !== 'undefined' && this.visibilityHandler) {
       document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
     }
-    if (typeof window !== 'undefined' && this.unloadHandler) {
-      window.removeEventListener('pagehide', this.unloadHandler);
-      window.removeEventListener('beforeunload', this.unloadHandler);
-    }
-    if (this.client) {
-      if (!this.isHost && this.client.connected && this.myId) {
-        this.client.publish(
-          `${this.topicPrefix}/to/host`,
-          JSON.stringify({ type: 'PLAYER_LEAVE', playerId: this.myId })
-        );
+    if (typeof window !== 'undefined') {
+      if (this.onlineHandler) {
+        window.removeEventListener('online', this.onlineHandler);
+        this.onlineHandler = null;
       }
-      this.client.end(true);
-      this.client = null;
+      if (this.unloadHandler) {
+        window.removeEventListener('beforeunload', this.unloadHandler);
+        this.unloadHandler = null;
+      }
     }
-    this.connectedClients.clear();
+
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN && this.myId) {
+        try {
+          this.ws.send(
+            JSON.stringify({
+              type: this.isHost ? 'HOST_CLOSE' : 'PLAYER_LEAVE',
+              playerId: this.myId,
+            })
+          );
+        } catch {}
+      }
+      try {
+        this.ws.close(1000, 'DESTROY');
+      } catch {}
+      this.ws = null;
+    }
+    this.pendingOutbound = [];
   }
 }
