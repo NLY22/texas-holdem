@@ -21,7 +21,7 @@ export enum HandRank {
 export interface HandEvaluation {
   rank: HandRank;
   name: string;
-  score: number; // 包含主牌型和踢脚牌的比分加权
+  score: number;
   bestFive: Card[];
 }
 
@@ -31,12 +31,12 @@ export interface Player {
   avatar: string;
   chips: number;
   currentBet: number;
-  totalRoundBet: number; // 本局累计投入（用于边池计算）
+  totalRoundBet: number; // 本局累计投入
   holeCards: Card[];
   folded: boolean;
   isAllIn: boolean;
   isBot: boolean;
-  seatIndex: number; // 0 - 5 (6人桌)
+  seatIndex: number; // 0 - 5
   showCards?: boolean;
 }
 
@@ -76,20 +76,20 @@ export interface GameState {
   smallBlindIndex: number;
   bigBlindIndex: number;
   activePlayerIndex: number;
+  pendingPlayerIds: string[]; // 本轮待行动玩家列表 (核心状态机保证)
+  lastRaiserIndex: number;
   players: (Player | null)[];
   winners: WinnerInfo[];
   smallBlind: number;
   bigBlind: number;
-  turnTimeout: number; // 倒计时
   handNumber: number;
 }
 
-// P2P 消息协议
 export type P2PMessage =
   | { type: 'JOIN_REQUEST'; name: string; avatar: string; seatIndex?: number }
   | { type: 'JOIN_RESPONSE'; success: boolean; state?: GameState; error?: string }
   | { type: 'STATE_UPDATE'; state: GameState }
-  | { type: 'DEAL_CARDS'; cards: Card[] } // 仅发送给特定玩家的私密底牌
+  | { type: 'DEAL_CARDS'; cards: Card[] }
   | { type: 'PLAYER_ACTION'; action: GameAction }
   | { type: 'CHAT_MESSAGE'; sender: string; text: string }
   | { type: 'RESTART_GAME' };

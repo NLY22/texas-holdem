@@ -16,19 +16,20 @@ export function createInitialState(roomId: string, hostId: string): GameState {
     smallBlindIndex: 1,
     bigBlindIndex: 2,
     activePlayerIndex: -1,
+    pendingPlayerIds: [],
+    lastRaiserIndex: -1,
     players: [null, null, null, null, null, null],
     winners: [],
     smallBlind: 10,
     bigBlind: 20,
-    turnTimeout: 20,
     handNumber: 0,
   };
 }
 
 /**
- * 寻找指定位置顺时针方向下一个有效玩家席位
+ * 顺时针获取从 startIndex 之后的下一个有效玩家席位
  */
-function getNextPlayerIndex(
+export function getNextPlayerIndex(
   players: (Player | null)[],
   startIndex: number,
   filter: (p: Player) => boolean
@@ -41,6 +42,25 @@ function getNextPlayerIndex(
     }
   }
   return -1;
+}
+
+/**
+ * 获取从 startIndex 顺时针方向所有满足条件的玩家 ID 列表
+ */
+function getClockwisePlayerIds(
+  players: (Player | null)[],
+  startIndex: number,
+  filter: (p: Player) => boolean
+): string[] {
+  const result: string[] = [];
+  for (let i = 1; i <= players.length; i++) {
+    const idx = (startIndex + i) % players.length;
+    const p = players[idx];
+    if (p && filter(p)) {
+      result.push(p.id);
+    }
+  }
+  return result;
 }
 
 /**
@@ -57,7 +77,7 @@ export function startNewHand(state: GameState): { state: GameState; deck: Card[]
 
   let deck = shuffleDeck(createDeck());
 
-  // 1. 移动庄家 Button
+  // 1. 顺时针移动庄家 Button
   const nextDealer = getNextPlayerIndex(state.players, state.dealerIndex, p => p.chips > 0);
   const nextSB = activePlayers.length === 2
     ? nextDealer // 单挑 (Heads-up) 规则：庄家也是小盲注
@@ -100,14 +120,25 @@ export function startNewHand(state: GameState): { state: GameState; deck: Card[]
     };
   });
 
-  // 3. 翻牌前首先行动者 (UTG 枪口位)：大盲注顺时针下一个
-  const firstActiveIndex = getNextPlayerIndex(newPlayers, nextBB, p => !p.folded && !p.isAllIn);
+  // 3. 翻牌前行动序列：从大盲注顺时针下一个 (UTG) 开始，最后到大盲注 (BB 享有 Option)
+  const pendingPlayerIds = getClockwisePlayerIds(
+    newPlayers,
+    nextBB,
+    p => !p.folded && !p.isAllIn
+  );
+
+  const firstActiveIndex = pendingPlayerIds.length > 0
+    ? newPlayers.findIndex(p => p && p.id === pendingPlayerIds[0])
+    : -1;
 
   const nextState: GameState = {
     ...state,
     stage: 'PREFLOP',
     communityCards: [],
-    pots: [{ amount: totalPot, eligiblePlayerIds: newPlayers.filter((p): p is Player => p !== null && !p.folded).map(p => p.id) }],
+    pots: [{
+      amount: totalPot,
+      eligiblePlayerIds: newPlayers.filter((p): p is Player => p !== null && !p.folded).map(p => p.id)
+    }],
     totalPot,
     currentBet: state.bigBlind,
     minRaise: state.bigBlind,
@@ -115,6 +146,8 @@ export function startNewHand(state: GameState): { state: GameState; deck: Card[]
     smallBlindIndex: nextSB,
     bigBlindIndex: nextBB,
     activePlayerIndex: firstActiveIndex,
+    pendingPlayerIds,
+    lastRaiserIndex: nextBB,
     players: newPlayers,
     winners: [],
     handNumber: state.handNumber + 1
@@ -130,10 +163,10 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
   const newDeck = [...deck];
   const activePlayers = state.players.filter((p): p is Player => p !== null && !p.folded);
 
-  // 重置各玩家本轮当前注为 0，累计投入保持在 totalRoundBet
+  // 重置各玩家当前轮下注为 0
   const resetPlayers = state.players.map(p => (p ? { ...p, currentBet: 0 } : null));
 
-  // 检查是否只剩 1 人未弃牌，或者所有未弃牌玩家都已经 All-in
+  // 检查是否所有未弃牌玩家都已经 All-in，或只剩 1 位未全下玩家
   const nonAllInPlayers = activePlayers.filter(p => !p.isAllIn);
   const shouldRunOut = nonAllInPlayers.length <= 1;
 
@@ -142,15 +175,15 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
 
   if (state.stage === 'PREFLOP') {
     nextStage = 'FLOP';
-    newDeck.pop(); // 烧一张牌
+    newDeck.pop(); // 烧一张
     newCommunity.push(newDeck.pop()!, newDeck.pop()!, newDeck.pop()!);
   } else if (state.stage === 'FLOP') {
     nextStage = 'TURN';
-    newDeck.pop(); // 烧一张牌
+    newDeck.pop(); // 烧一张
     newCommunity.push(newDeck.pop()!);
   } else if (state.stage === 'TURN') {
     nextStage = 'RIVER';
-    newDeck.pop(); // 烧牌
+    newDeck.pop(); // 烧一张
     newCommunity.push(newDeck.pop()!);
   } else if (state.stage === 'RIVER') {
     nextStage = 'SHOWDOWN';
@@ -160,9 +193,8 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
   const validPlayers = resetPlayers.filter((p): p is Player => p !== null);
   const pots = calculatePots(validPlayers);
 
-  // 如果已经达到摊牌，或者所有人都 All-in 且已经发满 5 张牌
+  // 如果达到摊牌，或者所有未弃牌玩家都已经 All-in，直接发满 5 张牌决胜
   if (nextStage === 'SHOWDOWN' || (shouldRunOut && newCommunity.length === 5)) {
-    // 补齐公共牌直到 5 张
     while (newCommunity.length < 5 && newDeck.length > 0) {
       newDeck.pop();
       newCommunity.push(newDeck.pop()!);
@@ -170,14 +202,14 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
 
     const winners = resolveWinners(pots, validPlayers, newCommunity);
 
-    // 将筹码分发给赢家
+    // 将筹码奖励发放给赢家
     const finalPlayers = resetPlayers.map(p => {
       if (!p) return null;
       const win = winners.find(w => w.playerId === p.id);
       return {
         ...p,
         chips: p.chips + (win ? win.amount : 0),
-        showCards: !p.folded // 摊牌亮底牌
+        showCards: !p.folded // 亮出底牌
       };
     });
 
@@ -187,9 +219,11 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
         stage: 'SHOWDOWN',
         communityCards: newCommunity,
         pots,
+        totalPot: 0,
         currentBet: 0,
         minRaise: state.bigBlind,
         activePlayerIndex: -1,
+        pendingPlayerIds: [],
         players: finalPlayers,
         winners
       },
@@ -197,8 +231,29 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
     };
   }
 
-  // 翻牌后首先行动者：小盲位后首位未弃牌且未全下的玩家
-  const nextActive = getNextPlayerIndex(resetPlayers, state.dealerIndex, p => !p.folded && !p.isAllIn);
+  // 翻牌后全新行动序列：从庄家顺时针开始所有未弃牌且未全下的玩家
+  const pendingPlayerIds = getClockwisePlayerIds(
+    resetPlayers,
+    state.dealerIndex,
+    p => !p.folded && !p.isAllIn
+  );
+
+  const nextActive = pendingPlayerIds.length > 0
+    ? resetPlayers.findIndex(p => p && p.id === pendingPlayerIds[0])
+    : -1;
+
+  // 如果翻牌后没有需要行动的玩家（例如都已全下），直接再次推进
+  if (pendingPlayerIds.length === 0) {
+    return advanceStage({
+      ...state,
+      stage: nextStage,
+      communityCards: newCommunity,
+      pots,
+      currentBet: 0,
+      minRaise: state.bigBlind,
+      players: resetPlayers
+    }, newDeck);
+  }
 
   return {
     state: {
@@ -209,6 +264,8 @@ export function advanceStage(state: GameState, deck: Card[]): { state: GameState
       currentBet: 0,
       minRaise: state.bigBlind,
       activePlayerIndex: nextActive,
+      pendingPlayerIds,
+      lastRaiserIndex: -1,
       players: resetPlayers
     },
     deck: newDeck
@@ -233,6 +290,8 @@ export function handlePlayerAction(
   let currentBet = state.currentBet;
   let minRaise = state.minRaise;
   let totalPot = state.totalPot;
+  let lastRaiserIndex = state.lastRaiserIndex;
+  let newPendingPlayerIds = [...state.pendingPlayerIds];
 
   switch (action.type) {
     case 'FOLD':
@@ -240,7 +299,6 @@ export function handlePlayerAction(
       break;
 
     case 'CHECK':
-      // 只能在当前注已被跟平的情况下 CHECK
       break;
 
     case 'CALL': {
@@ -256,7 +314,7 @@ export function handlePlayerAction(
 
     case 'BET':
     case 'RAISE': {
-      const targetBet = action.amount || currentBet + minRaise;
+      const targetBet = action.amount || (currentBet + minRaise);
       const addedChips = targetBet - player.currentBet;
       const actualAdd = Math.min(player.chips, addedChips);
 
@@ -270,7 +328,15 @@ export function handlePlayerAction(
         minRaise = raiseDiff;
       }
       currentBet = updatedPlayer.currentBet;
+      lastRaiserIndex = playerIndex;
       if (updatedPlayer.chips === 0) updatedPlayer.isAllIn = true;
+
+      // 加注产生！重置其他所有未弃牌且未全下的玩家的待行动状态！
+      newPendingPlayerIds = getClockwisePlayerIds(
+        state.players,
+        playerIndex,
+        p => p.id !== player.id && !p.folded && !p.isAllIn
+      );
       break;
     }
 
@@ -288,6 +354,14 @@ export function handlePlayerAction(
           minRaise = raiseDiff;
         }
         currentBet = updatedPlayer.currentBet;
+        lastRaiserIndex = playerIndex;
+
+        // 如果全下金额超过当前最高注，重置其他人待行动
+        newPendingPlayerIds = getClockwisePlayerIds(
+          state.players,
+          playerIndex,
+          p => p.id !== player.id && !p.folded && !p.isAllIn
+        );
       }
       break;
     }
@@ -296,7 +370,10 @@ export function handlePlayerAction(
   const updatedPlayers = [...state.players];
   updatedPlayers[playerIndex] = updatedPlayer;
 
-  // 1. 检查是否只剩最后 1 个未弃牌玩家 (直接提前获胜)
+  // 从待行动队列中移除当前已行动玩家
+  newPendingPlayerIds = newPendingPlayerIds.filter(id => id !== player.id);
+
+  // 1. 检查是否只剩最后 1 个未弃牌玩家 (直接提前结束赢取底池)
   const nonFolded = updatedPlayers.filter((p): p is Player => p !== null && !p.folded);
   if (nonFolded.length === 1) {
     const soleWinner = nonFolded[0];
@@ -317,6 +394,7 @@ export function handlePlayerAction(
         stage: 'SHOWDOWN',
         totalPot: 0,
         activePlayerIndex: -1,
+        pendingPlayerIds: [],
         players: finalPlayers,
         winners
       },
@@ -324,20 +402,8 @@ export function handlePlayerAction(
     };
   }
 
-  // 2. 检查本轮下注是否已全部结束
-  // 结束条件：所有未弃牌玩家均已行动，且当前注已跟平 (或已 All-in)
-  const canActPlayers = nonFolded.filter(p => !p.isAllIn);
-  const allBetsEqual = canActPlayers.every(p => p.currentBet === currentBet);
-
-  // 寻找下一个该行动的玩家
-  const nextPlayer = getNextPlayerIndex(
-    updatedPlayers,
-    playerIndex,
-    p => !p.folded && !p.isAllIn
-  );
-
-  // 如果下注全部平齐，或者场上只剩 0~1 位未全下的玩家，推进行动到下一阶段
-  if (allBetsEqual && (nextPlayer === -1 || nextPlayer <= state.dealerIndex || canActPlayers.length <= 1)) {
+  // 2. 检查本轮下注是否结束：待行动队列已清空
+  if (newPendingPlayerIds.length === 0) {
     return advanceStage({
       ...state,
       totalPot,
@@ -347,13 +413,19 @@ export function handlePlayerAction(
     }, deck);
   }
 
+  // 3. 否则顺延给待行动队列中的第一位玩家
+  const nextPlayerId = newPendingPlayerIds[0];
+  const nextPlayerIndex = updatedPlayers.findIndex(p => p && p.id === nextPlayerId);
+
   return {
     state: {
       ...state,
       totalPot,
       currentBet,
       minRaise,
-      activePlayerIndex: nextPlayer,
+      lastRaiserIndex,
+      activePlayerIndex: nextPlayerIndex,
+      pendingPlayerIds: newPendingPlayerIds,
       players: updatedPlayers
     },
     deck

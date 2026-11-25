@@ -12,8 +12,8 @@ import { soundManager } from './audio/sounds';
 export const App: React.FC = () => {
   const [inLobby, setInLobby] = useState(true);
   const [gameState, setGameState] = useState<GameState>(createInitialState('TX-8821', 'host'));
-  const [localPlayerId, setLocalPlayerId] = useState<string>('');
-  const [isHost, setIsHost] = useState(false);
+  const [localPlayerId, setLocalPlayerId] = useState<string>('local-user');
+  const [isHost, setIsHost] = useState(true);
   const [myPrivateCards, setMyPrivateCards] = useState<Card[]>([]);
 
   const deckRef = useRef<Card[]>([]);
@@ -25,7 +25,7 @@ export const App: React.FC = () => {
   const urlParams = new URLSearchParams(window.location.search);
   const initialRoomParam = urlParams.get('room') || '';
 
-  // 1. 初始化房主网络
+  // 1. 初始化房主网络 (联机模式)
   const initHostGame = async (roomId: string, playerName: string) => {
     const net = new P2PNetwork({
       onPlayerJoinRequest: (conn, data) => {
@@ -42,7 +42,6 @@ export const App: React.FC = () => {
       setIsHost(true);
       setLocalPlayerId(net.myId);
 
-      // 创建初始状态并将房主放入 0 号席位
       const hostPlayer: Player = {
         id: net.myId,
         name: playerName,
@@ -63,6 +62,7 @@ export const App: React.FC = () => {
         players: newPlayers
       };
 
+      stateRef.current = initState;
       setGameState(initState);
       setInLobby(false);
     } catch (e: any) {
@@ -74,6 +74,7 @@ export const App: React.FC = () => {
   const initClientGame = async (roomId: string, playerName: string) => {
     const net = new P2PNetwork({
       onStateUpdate: (state) => {
+        stateRef.current = state;
         setGameState(state);
       },
       onDealCards: (cards) => {
@@ -96,10 +97,7 @@ export const App: React.FC = () => {
   const handleNewPlayerJoin = (peerId: string, name: string, avatar: string) => {
     const currentState = stateRef.current;
     const emptySeatIndex = currentState.players.findIndex(p => p === null);
-
-    if (emptySeatIndex === -1) {
-      return; // 满座
-    }
+    if (emptySeatIndex === -1) return;
 
     const newPlayer: Player = {
       id: peerId,
@@ -123,27 +121,41 @@ export const App: React.FC = () => {
       players: updatedPlayers
     };
 
+    stateRef.current = updatedState;
     setGameState(updatedState);
     networkRef.current?.broadcastState(updatedState);
   };
 
-  // 4. 房主发牌开局
+  // 4. 发牌开局
   const handleStartHand = () => {
     if (!isHost) return;
     soundManager.playCardDeal();
 
-    const { state: nextState, deck } = startNewHand(stateRef.current);
+    let current = stateRef.current;
+    // 若练习房仅剩不到 2 人有筹码，自动为出局电脑补买筹码
+    const aliveCount = current.players.filter(p => p !== null && p.chips > 0).length;
+    if (aliveCount < 2) {
+      const refilled = current.players.map(p =>
+        p && p.isBot && p.chips <= 0 ? { ...p, chips: 1000 } : p
+      );
+      current = { ...current, players: refilled };
+    }
+
+    const { state: nextState, deck } = startNewHand(current);
     deckRef.current = deck;
+    stateRef.current = nextState;
     setGameState(nextState);
+
+    // 更新本地底牌展示
+    const humanPlayer = nextState.players.find(p => p && p.id === localPlayerId);
+    if (humanPlayer && humanPlayer.holeCards.length === 2) {
+      setMyPrivateCards(humanPlayer.holeCards);
+    }
 
     // 给每个非机器人客户端分发私密底牌
     nextState.players.forEach(p => {
-      if (p && !p.isBot && p.holeCards.length === 2) {
-        if (p.id === localPlayerId) {
-          setMyPrivateCards(p.holeCards);
-        } else {
-          networkRef.current?.sendPrivateCards(p.id, p.holeCards);
-        }
+      if (p && !p.isBot && p.holeCards.length === 2 && p.id !== localPlayerId) {
+        networkRef.current?.sendPrivateCards(p.id, p.holeCards);
       }
     });
 
@@ -158,6 +170,7 @@ export const App: React.FC = () => {
       deckRef.current
     );
     deckRef.current = deck;
+    stateRef.current = updatedState;
     setGameState(updatedState);
     networkRef.current?.broadcastState(updatedState);
   };
@@ -175,14 +188,16 @@ export const App: React.FC = () => {
       const activePlayer = currentState.players[currentState.activePlayerIndex];
       if (activePlayer && activePlayer.isBot && !activePlayer.folded && !activePlayer.isAllIn) {
         const timer = setTimeout(() => {
-          const botAction = getBotAction(currentState, activePlayer);
-          processActionAsHost(botAction);
-        }, 1000 + Math.random() * 800);
+          if (stateRef.current.activePlayerIndex === activePlayer.seatIndex) {
+            const botAction = getBotAction(stateRef.current, activePlayer);
+            processActionAsHost(botAction);
+          }
+        }, 700 + Math.random() * 500);
 
         return () => clearTimeout(timer);
       }
     }
-  }, [gameState, isHost]);
+  }, [gameState.activePlayerIndex, gameState.stage, isHost]);
 
   // 7. 发送玩家操作
   const handleLocalAction = (action: GameAction) => {
@@ -197,16 +212,16 @@ export const App: React.FC = () => {
   const handleAddBot = (seatIdx?: number) => {
     if (!isHost) return;
     const currentState = stateRef.current;
-    let targetIndex = seatIdx !== undefined ? seatIdx : currentState.players.findIndex(p => p === null);
-
+    const targetIndex = seatIdx !== undefined ? seatIdx : currentState.players.findIndex(p => p === null);
     if (targetIndex === -1) return;
 
     const botNames = ['高斯', '图灵', '阿尔法', '深蓝', '冯诺依曼', '香农'];
-    const botName = 'AI·' + botNames[Math.floor(Math.random() * botNames.length)];
+    const usedNames = currentState.players.filter(Boolean).map(p => p!.name);
+    const availableName = botNames.find(n => !usedNames.includes('AI·' + n)) || botNames[Math.floor(Math.random() * botNames.length)];
 
     const botPlayer: Player = {
       id: 'bot-' + Math.random().toString(36).substring(2, 8),
-      name: botName,
+      name: 'AI·' + availableName,
       avatar: '',
       chips: 1000,
       currentBet: 0,
@@ -222,58 +237,110 @@ export const App: React.FC = () => {
     newPlayers[targetIndex] = botPlayer;
 
     const nextState = { ...currentState, players: newPlayers };
+    stateRef.current = nextState;
     setGameState(nextState);
     networkRef.current?.broadcastState(nextState);
   };
 
-  // 9. 一键单人秒开 (自带5个电脑)
-  const handleQuickPractice = async () => {
-    const roomId = 'SOLO-' + Math.floor(100 + Math.random() * 900);
-    await initHostGame(roomId, '扑克高手');
+  // 9. 等待阶段房主换座
+  const handleSitDown = (targetSeatIndex: number) => {
+    if (!isHost || stateRef.current.stage !== 'WAITING') return;
+    const currentState = stateRef.current;
+    if (currentState.players[targetSeatIndex] !== null) return;
 
-    setTimeout(() => {
-      const botNames = ['图灵', '阿尔法', '高斯', '深蓝', '香农'];
-      const current = stateRef.current;
-      const filledPlayers = [...current.players];
+    const currentIdx = currentState.players.findIndex(p => p && p.id === localPlayerId);
+    if (currentIdx === -1 || currentIdx === targetSeatIndex) return;
 
-      for (let i = 1; i <= 5; i++) {
-        filledPlayers[i] = {
-          id: 'bot-' + i,
-          name: 'AI·' + botNames[i - 1],
-          avatar: '',
-          chips: 1000,
-          currentBet: 0,
-          totalRoundBet: 0,
-          holeCards: [],
-          folded: false,
-          isAllIn: false,
-          isBot: true,
-          seatIndex: i
-        };
-      }
+    const newPlayers = [...currentState.players];
+    const movingPlayer = { ...newPlayers[currentIdx]!, seatIndex: targetSeatIndex };
+    newPlayers[currentIdx] = null;
+    newPlayers[targetSeatIndex] = movingPlayer;
 
-      const readyState = { ...current, players: filledPlayers };
-      setGameState(readyState);
+    const nextState = { ...currentState, players: newPlayers };
+    stateRef.current = nextState;
+    setGameState(nextState);
+    networkRef.current?.broadcastState(nextState);
+  };
 
-      // 自动发牌开始第一局
-      const { state: startedState, deck } = startNewHand(readyState);
-      deckRef.current = deck;
-      setGameState(startedState);
-      if (startedState.players[0]) {
-        setMyPrivateCards(startedState.players[0].holeCards);
-      }
-    }, 400);
+  // 10. 本地玩家重买筹码
+  const handleRebuy = () => {
+    if (!isHost) return;
+    const currentState = stateRef.current;
+    const updatedPlayers = currentState.players.map(p =>
+      p && p.id === localPlayerId && p.chips <= 0 ? { ...p, chips: 1000 } : p
+    );
+    const nextState = { ...currentState, players: updatedPlayers };
+    stateRef.current = nextState;
+    setGameState(nextState);
+    networkRef.current?.broadcastState(nextState);
+  };
+
+  // 11. 一键单人秒开 (完全本地即时初始化，零等待零网络依赖)
+  const handleQuickPractice = () => {
+    const localId = 'local-player-0';
+    setLocalPlayerId(localId);
+    setIsHost(true);
+
+    const humanPlayer: Player = {
+      id: localId,
+      name: '您 (VIP)',
+      avatar: '',
+      chips: 1000,
+      currentBet: 0,
+      totalRoundBet: 0,
+      holeCards: [],
+      folded: false,
+      isAllIn: false,
+      isBot: false,
+      seatIndex: 0
+    };
+
+    const botNames = ['图灵', '阿尔法', '高斯', '深蓝', '香农'];
+    const filledPlayers: (Player | null)[] = [humanPlayer];
+
+    for (let i = 1; i <= 5; i++) {
+      filledPlayers.push({
+        id: 'bot-' + i,
+        name: 'AI·' + botNames[i - 1],
+        avatar: '',
+        chips: 1000,
+        currentBet: 0,
+        totalRoundBet: 0,
+        holeCards: [],
+        folded: false,
+        isAllIn: false,
+        isBot: true,
+        seatIndex: i
+      });
+    }
+
+    const readyState: GameState = {
+      ...createInitialState('PRACTICE', localId),
+      players: filledPlayers
+    };
+
+    const { state: startedState, deck } = startNewHand(readyState);
+    deckRef.current = deck;
+    stateRef.current = startedState;
+    setGameState(startedState);
+
+    if (startedState.players[0]) {
+      setMyPrivateCards(startedState.players[0].holeCards);
+    }
+
+    soundManager.playCardDeal();
+    setInLobby(false);
   };
 
   // 当前视角玩家
   let localPlayer = gameState.players.find(p => p && p.id === localPlayerId) || null;
-  // 如果是客户端，把私密底牌合并进当前展示
-  if (localPlayer && !isHost && myPrivateCards.length === 2) {
+  if (localPlayer && myPrivateCards.length === 2 && gameState.stage !== 'SHOWDOWN') {
     localPlayer = { ...localPlayer, holeCards: myPrivateCards };
   }
 
   const activeCount = gameState.players.filter(p => p !== null && p.chips > 0).length;
-  const canStartHand = isHost && (gameState.stage === 'WAITING' || gameState.stage === 'SHOWDOWN') && activeCount >= 2;
+  const isTableFull = gameState.players.every(p => p !== null);
+  const canStartInHeader = isHost && gameState.stage === 'WAITING' && activeCount >= 2;
 
   return (
     <div className="min-h-screen w-full flex flex-col items-center justify-between bg-neutral-950 overflow-hidden relative">
@@ -297,23 +364,24 @@ export const App: React.FC = () => {
         <HeaderBar
           roomId={gameState.roomId}
           isHost={isHost}
-          canStart={canStartHand}
+          canStart={canStartInHeader}
+          isTableFull={isTableFull}
           onStartHand={handleStartHand}
           onAddBot={() => handleAddBot()}
           handNumber={gameState.handNumber}
         />
       )}
 
-      {/* 核心扑克桌 */}
+      {/* 核心扑克桌 (上下均预留安全区，防止顶部席位触及顶栏、底部席位触及操作栏) */}
       {!inLobby && (
-        <main className="flex-1 w-full flex items-center justify-center p-2 relative">
+        <main className="flex-1 w-full flex items-center justify-center px-2 pt-10 pb-40 sm:pb-44 relative">
           <Table
             gameState={gameState}
             localPlayer={localPlayer}
-            onSitDown={seatIdx => {
-              // 占位
-            }}
+            onSitDown={isHost ? handleSitDown : undefined}
             onAddBot={isHost ? seatIdx => handleAddBot(seatIdx) : undefined}
+            onNextHand={isHost && activeCount >= 2 ? handleStartHand : undefined}
+            onRebuy={isHost ? handleRebuy : undefined}
           />
         </main>
       )}
