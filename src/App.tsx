@@ -28,8 +28,8 @@ export const App: React.FC = () => {
   // 1. 初始化房主网络 (联机模式)
   const initHostGame = async (roomId: string, playerName: string) => {
     const net = new P2PNetwork({
-      onPlayerJoinRequest: (conn, data) => {
-        handleNewPlayerJoin(conn.peer, data.name, data.avatar);
+      onPlayerJoinRequest: (peerId, data) => {
+        handleNewPlayerJoin(peerId, data.name, data.avatar);
       },
       onActionReceived: (action) => {
         processActionAsHost(action);
@@ -42,38 +42,34 @@ export const App: React.FC = () => {
       }
     });
 
-    try {
-      await net.createRoom(roomId);
-      networkRef.current = net;
-      setIsHost(true);
-      setLocalPlayerId(net.myId);
+    await net.createRoom(roomId);
+    networkRef.current = net;
+    setIsHost(true);
+    setLocalPlayerId(net.myId);
 
-      const hostPlayer: Player = {
-        id: net.myId,
-        name: playerName,
-        avatar: '',
-        chips: 1000,
-        currentBet: 0,
-        totalRoundBet: 0,
-        holeCards: [],
-        folded: false,
-        isAllIn: false,
-        isBot: false,
-        seatIndex: 0
-      };
+    const hostPlayer: Player = {
+      id: net.myId,
+      name: playerName,
+      avatar: '',
+      chips: 1000,
+      currentBet: 0,
+      totalRoundBet: 0,
+      holeCards: [],
+      folded: false,
+      isAllIn: false,
+      isBot: false,
+      seatIndex: 0
+    };
 
-      const newPlayers = [hostPlayer, null, null, null, null, null];
-      const initState = {
-        ...createInitialState(roomId, net.myId),
-        players: newPlayers
-      };
+    const newPlayers = [hostPlayer, null, null, null, null, null];
+    const initState = {
+      ...createInitialState(roomId, net.myId),
+      players: newPlayers
+    };
 
-      stateRef.current = initState;
-      setGameState(initState);
-      setInLobby(false);
-    } catch (e: any) {
-      alert(e.message || '创建房间失败');
-    }
+    stateRef.current = initState;
+    setGameState(initState);
+    setInLobby(false);
   };
 
   // 2. 初始化加入玩家网络
@@ -100,16 +96,12 @@ export const App: React.FC = () => {
       }
     });
 
-    try {
-      await net.joinRoom(roomId, playerName, '');
-      myAssignedId = net.myId;
-      networkRef.current = net;
-      setIsHost(false);
-      setLocalPlayerId(net.myId);
-      setInLobby(false);
-    } catch (e: any) {
-      alert(e.message || '加入房间失败');
-    }
+    await net.joinRoom(roomId, playerName, '');
+    myAssignedId = net.myId;
+    networkRef.current = net;
+    setIsHost(false);
+    setLocalPlayerId(net.myId);
+    setInLobby(false);
   };
 
   // 3. 房主处理新玩家入座 (含满座拒绝与中途加入观战保护)
@@ -470,12 +462,12 @@ export const App: React.FC = () => {
       {inLobby && (
         <LobbyModal
           initialRoomId={initialRoomParam}
-          onCreateRoom={(nickname) => {
+          onCreateRoom={async (nickname) => {
             const rid = 'TX-' + Math.floor(1000 + Math.random() * 9000);
-            initHostGame(rid, nickname);
+            await initHostGame(rid, nickname);
           }}
-          onJoinRoom={(rid, nickname) => {
-            initClientGame(rid, nickname);
+          onJoinRoom={async (rid, nickname) => {
+            await initClientGame(rid, nickname);
           }}
           onQuickPractice={handleQuickPractice}
         />

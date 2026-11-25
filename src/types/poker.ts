@@ -86,11 +86,12 @@ export interface GameState {
 }
 
 export type P2PMessage =
-  | { type: 'JOIN_REQUEST'; name: string; avatar: string; seatIndex?: number }
+  | { type: 'JOIN_REQUEST'; senderId?: string; name: string; avatar: string; seatIndex?: number }
   | { type: 'JOIN_RESPONSE'; success: boolean; state?: GameState; error?: string }
   | { type: 'STATE_UPDATE'; state: GameState }
   | { type: 'DEAL_CARDS'; cards: Card[] }
   | { type: 'PLAYER_ACTION'; action: GameAction }
   | { type: 'REBUY_REQUEST'; playerId: string }
+  | { type: 'PLAYER_LEAVE'; playerId: string }
   | { type: 'CHAT_MESSAGE'; sender: string; text: string }
   | { type: 'RESTART_GAME' };

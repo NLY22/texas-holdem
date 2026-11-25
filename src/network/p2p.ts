@@ -1,17 +1,44 @@
-import Peer, { DataConnection } from 'peerjs';
+import mqtt, { MqttClient } from 'mqtt';
 import { GameAction, GameState, P2PMessage } from '../types/poker';
 
+const BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
+
+/**
+ * 规范化房间号：支持用户输入 "8821"、"tx-8821"、"tx8821" 或完整邀请 URL
+ */
+export function normalizeRoomId(raw: string): string {
+  let clean = raw.trim();
+  const urlMatch = clean.match(/[?&]room=([^&]+)/i);
+  if (urlMatch && urlMatch[1]) {
+    clean = decodeURIComponent(urlMatch[1]).trim();
+  }
+  clean = clean.toUpperCase();
+  if (/^\d{4}$/.test(clean)) {
+    return `TX-${clean}`;
+  }
+  if (/^TX(\d{4})$/.test(clean)) {
+    return `TX-${clean.slice(2)}`;
+  }
+  return clean;
+}
+
 export class P2PNetwork {
-  private peer: Peer | null = null;
-  private connections: Map<string, DataConnection> = new Map();
-  private hostConnection: DataConnection | null = null;
+  private client: MqttClient | null = null;
+  private connectedClients: Set<string> = new Set();
+  private topicPrefix: string = '';
+  private visibilityHandler?: () => void;
+  private unloadHandler?: () => void;
+
   public myId: string = '';
   public isHost: boolean = false;
 
   private onStateUpdateCb?: (state: GameState) => void;
   private onDealCardsCb?: (cards: any[]) => void;
   private onActionReceivedCb?: (action: GameAction) => void;
-  private onPlayerJoinRequestCb?: (conn: DataConnection, data: any) => void;
+  private onPlayerJoinRequestCb?: (peerId: string, data: any) => void;
   private onPlayerDisconnectCb?: (peerId: string) => void;
   private onRebuyRequestCb?: (playerId: string) => void;
 
@@ -20,7 +47,7 @@ export class P2PNetwork {
       onStateUpdate?: (state: GameState) => void;
       onDealCards?: (cards: any[]) => void;
       onActionReceived?: (action: GameAction) => void;
-      onPlayerJoinRequest?: (conn: DataConnection, data: any) => void;
+      onPlayerJoinRequest?: (peerId: string, data: any) => void;
       onPlayerDisconnect?: (peerId: string) => void;
       onRebuyRequest?: (playerId: string) => void;
     }
@@ -33,232 +60,353 @@ export class P2PNetwork {
     this.onRebuyRequestCb = callbacks.onRebuyRequest;
   }
 
-  // 1. 作为房主创建房间
-  createRoom(roomId: string): Promise<string> {
+  private connectWithFallback(
+    optionsFactory: (brokerUrl: string) => { url: string; opts: mqtt.IClientOptions }
+  ): Promise<MqttClient> {
     return new Promise((resolve, reject) => {
-      this.isHost = true;
-      const peerId = `poker-room-${roomId.toLowerCase()}`;
+      let currentIdx = 0;
+      let resolved = false;
 
-      this.peer = new Peer(peerId, {
-        debug: 1,
-      });
-
-      this.peer.on('open', id => {
-        this.myId = id;
-        console.log('房主 P2P 初始化成功，PeerID:', id);
-        resolve(id);
-      });
-
-      this.peer.on('connection', conn => {
-        console.log('有新玩家连接进来:', conn.peer);
-        this.setupConnection(conn);
-      });
-
-      this.peer.on('error', err => {
-        console.error('PeerJS 出错:', err);
-        if (err.type === 'unavailable-id') {
-          reject(new Error('房间号已被占用，请换一个房间号'));
-        } else {
-          reject(err);
+      const tryNext = () => {
+        if (currentIdx >= BROKERS.length) {
+          if (!resolved) {
+            resolved = true;
+            reject(new Error('无法连接到联机服务器，请检查手机网络后重试'));
+          }
+          return;
         }
-      });
+
+        const brokerUrl = BROKERS[currentIdx++];
+        const { url, opts } = optionsFactory(brokerUrl);
+        const client = mqtt.connect(url, opts);
+
+        const connectTimer = setTimeout(() => {
+          if (!resolved && !client.connected) {
+            client.end(true);
+            tryNext();
+          }
+        }, 5000);
+
+        client.on('connect', () => {
+          clearTimeout(connectTimer);
+          if (!resolved) {
+            resolved = true;
+            resolve(client);
+          }
+        });
+
+        client.on('error', err => {
+          console.warn('MQTT 连接异常:', brokerUrl, err.message);
+          if (!resolved) {
+            clearTimeout(connectTimer);
+            client.end(true);
+            tryNext();
+          }
+        });
+      };
+
+      tryNext();
     });
   }
 
-  // 2. 作为玩家加入房间
-  joinRoom(roomId: string, playerName: string, avatar: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.isHost = false;
-      this.peer = new Peer({ debug: 1 });
+  private attachMobileLifecycleHooks() {
+    if (typeof document !== 'undefined') {
+      this.visibilityHandler = () => {
+        if (document.visibilityState === 'visible' && this.client && !this.client.connected) {
+          console.log('页面切回前台，自动恢复房间连接...');
+          this.client.reconnect();
+        }
+      };
+      document.addEventListener('visibilitychange', this.visibilityHandler);
+    }
+
+    if (typeof window !== 'undefined' && !this.isHost) {
+      this.unloadHandler = () => {
+        if (this.client && this.client.connected && this.myId) {
+          this.client.publish(
+            `${this.topicPrefix}/to/host`,
+            JSON.stringify({ type: 'PLAYER_LEAVE', playerId: this.myId })
+          );
+        }
+      };
+      window.addEventListener('pagehide', this.unloadHandler);
+      window.addEventListener('beforeunload', this.unloadHandler);
+    }
+  }
+
+  // 1. 作为房主创建房间
+  async createRoom(rawRoomId: string): Promise<string> {
+    const roomId = normalizeRoomId(rawRoomId);
+    this.isHost = true;
+    this.myId = 'host-' + Math.random().toString(36).substring(2, 8);
+    this.topicPrefix = `txholdem/v2/${roomId}`;
+
+    const client = await this.connectWithFallback(url => ({
+      url,
+      opts: {
+        clientId: `txh_${this.myId}_${Date.now()}`,
+        clean: true,
+        connectTimeout: 5000,
+        keepalive: 20,
+        reconnectPeriod: 1500,
+      },
+    }));
+
+    this.client = client;
+    this.attachMobileLifecycleHooks();
+
+    await new Promise<void>((resolve, reject) => {
+      client.subscribe(`${this.topicPrefix}/to/host`, { qos: 1 }, err => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    client.on('message', (_topic, payload) => {
+      try {
+        const msg = JSON.parse(payload.toString()) as P2PMessage;
+        this.handleHostMessage(msg);
+      } catch (e) {
+        console.error('解析消息失败:', e);
+      }
+    });
+
+    console.log('房主房间初始化成功，房间:', roomId, 'HostID:', this.myId);
+    return this.myId;
+  }
+
+  private handleHostMessage(msg: P2PMessage) {
+    switch (msg.type) {
+      case 'JOIN_REQUEST':
+        if (msg.senderId) {
+          this.connectedClients.add(msg.senderId);
+          this.onPlayerJoinRequestCb?.(msg.senderId, msg);
+        }
+        break;
+
+      case 'PLAYER_ACTION':
+        this.onActionReceivedCb?.(msg.action);
+        break;
+
+      case 'REBUY_REQUEST':
+        this.onRebuyRequestCb?.(msg.playerId);
+        break;
+
+      case 'PLAYER_LEAVE':
+        if (this.connectedClients.has(msg.playerId)) {
+          this.connectedClients.delete(msg.playerId);
+          this.onPlayerDisconnectCb?.(msg.playerId);
+        }
+        break;
+    }
+  }
+
+  // 2. 作为玩家加入房间 (内置重发机制，防止房主切微信发链接时短暂掉线漏包)
+  async joinRoom(rawRoomId: string, playerName: string, avatar: string): Promise<void> {
+    const roomId = normalizeRoomId(rawRoomId);
+    if (!roomId) {
+      throw new Error('请输入有效的房间号');
+    }
+
+    this.isHost = false;
+    this.myId = 'p-' + Math.random().toString(36).substring(2, 10);
+    this.topicPrefix = `txholdem/v2/${roomId}`;
+
+    const client = await this.connectWithFallback(url => ({
+      url,
+      opts: {
+        clientId: `txc_${this.myId}_${Date.now()}`,
+        clean: true,
+        connectTimeout: 5000,
+        keepalive: 20,
+        reconnectPeriod: 1500,
+        will: {
+          topic: `${this.topicPrefix}/to/host`,
+          payload: JSON.stringify({ type: 'PLAYER_LEAVE', playerId: this.myId }),
+          qos: 1,
+          retain: false,
+        },
+      },
+    }));
+
+    this.client = client;
+    this.attachMobileLifecycleHooks();
+
+    await new Promise<void>((resolve, reject) => {
+      client.subscribe(`${this.topicPrefix}/to/${this.myId}`, { qos: 1 }, err => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    return new Promise<void>((resolve, reject) => {
       let settled = false;
+      let retryTimer: any = null;
+      let timeoutTimer: any = null;
 
-      this.peer.on('open', myId => {
-        this.myId = myId;
-        const targetHostId = `poker-room-${roomId.toLowerCase()}`;
-        console.log('玩家 Peer 初始化完成，正在连接房主:', targetHostId);
+      const cleanupTimers = () => {
+        if (retryTimer) clearInterval(retryTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      };
 
-        const conn = this.peer!.connect(targetHostId, {
-          reliable: true,
-        });
-
-        conn.on('open', () => {
-          console.log('已连通房主，正在发送入座请求...');
-          this.hostConnection = conn;
-          this.setupConnection(conn, response => {
-            if (!settled) {
-              settled = true;
-              if (response.success) {
-                resolve();
-              } else {
-                conn.close();
-                reject(new Error(response.error || '加入房间失败'));
+      client.on('message', (_topic, payload) => {
+        try {
+          const msg = JSON.parse(payload.toString()) as P2PMessage;
+          switch (msg.type) {
+            case 'JOIN_RESPONSE':
+              if (!settled) {
+                settled = true;
+                cleanupTimers();
+                if (msg.success) {
+                  if (msg.state) this.onStateUpdateCb?.(msg.state);
+                  resolve();
+                } else {
+                  this.destroy();
+                  reject(new Error(msg.error || '加入房间失败'));
+                }
               }
-            }
-          });
+              break;
 
-          conn.send({
+            case 'STATE_UPDATE':
+              this.onStateUpdateCb?.(msg.state);
+              break;
+
+            case 'DEAL_CARDS':
+              this.onDealCardsCb?.(msg.cards);
+              break;
+          }
+        } catch (e) {
+          console.error('解析客户端消息失败:', e);
+        }
+      });
+
+      const sendJoin = () => {
+        if (!client.connected) return;
+        client.publish(
+          `${this.topicPrefix}/to/host`,
+          JSON.stringify({
             type: 'JOIN_REQUEST',
+            senderId: this.myId,
             name: playerName,
             avatar,
-          });
-        });
+          }),
+          { qos: 1 }
+        );
+      };
 
-        conn.on('error', err => {
-          console.error('连接房主失败:', err);
-          if (!settled) {
-            settled = true;
-            reject(err);
-          }
-        });
+      // 立即发送一次，若房主切到后台刚恢复，每 1.5 秒自动补发一次
+      sendJoin();
+      retryTimer = setInterval(sendJoin, 1500);
 
-        setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            reject(new Error('连接房间超时，请检查房间号是否正确或房主是否在线'));
-          }
-        }, 8000);
-      });
-
-      this.peer.on('error', err => {
-        console.error('P2P 错误:', err);
+      timeoutTimer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(err);
+          cleanupTimers();
+          this.destroy();
+          reject(new Error(`未找到房间 ${roomId}，请核对房间号并确认房主页面处于打开状态`));
         }
-      });
-    });
-  }
-
-  private setupConnection(
-    conn: DataConnection,
-    onJoinResponse?: (res: { success: boolean; error?: string }) => void
-  ) {
-    conn.on('data', rawData => {
-      const msg = rawData as P2PMessage;
-
-      switch (msg.type) {
-        case 'JOIN_REQUEST':
-          if (this.isHost) {
-            this.connections.set(conn.peer, conn);
-            this.onPlayerJoinRequestCb?.(conn, msg);
-          }
-          break;
-
-        case 'JOIN_RESPONSE':
-          onJoinResponse?.({ success: msg.success, error: msg.error });
-          if (msg.success && msg.state) {
-            this.onStateUpdateCb?.(msg.state);
-          }
-          break;
-
-        case 'STATE_UPDATE':
-          this.onStateUpdateCb?.(msg.state);
-          break;
-
-        case 'DEAL_CARDS':
-          this.onDealCardsCb?.(msg.cards);
-          break;
-
-        case 'PLAYER_ACTION':
-          if (this.isHost) {
-            this.onActionReceivedCb?.(msg.action);
-          }
-          break;
-
-        case 'REBUY_REQUEST':
-          if (this.isHost) {
-            this.onRebuyRequestCb?.(msg.playerId);
-          }
-          break;
-      }
-    });
-
-    conn.on('close', () => {
-      console.log('连接断开:', conn.peer);
-      this.connections.delete(conn.peer);
-      if (this.isHost) {
-        this.onPlayerDisconnectCb?.(conn.peer);
-      }
+      }, 9000);
     });
   }
 
   sendJoinResponse(peerId: string, success: boolean, state?: GameState, error?: string) {
-    const conn = this.connections.get(peerId);
-    if (conn && conn.open) {
-      const maskedState = state ? this.maskStateForPeer(state, peerId) : undefined;
-      conn.send({
+    if (!this.client || !this.client.connected) return;
+    const maskedState = state ? this.maskStateForPeer(state, peerId) : undefined;
+    this.client.publish(
+      `${this.topicPrefix}/to/${peerId}`,
+      JSON.stringify({
         type: 'JOIN_RESPONSE',
         success,
         state: maskedState,
-        error
-      });
-    }
+        error,
+      }),
+      { qos: 1 }
+    );
   }
 
   private maskStateForPeer(state: GameState, peerId: string): GameState {
     const maskedPlayers = state.players.map(p => {
       if (!p) return null;
-      // 仅允许该玩家本人查看自己底牌，或合法摊牌亮牌玩家 (showCards === true)
       if (p.id === peerId || p.showCards) {
         return p;
       }
       return {
         ...p,
-        holeCards: p.holeCards.map(() => ({ suit: 'spades' as const, rank: 0 }))
+        holeCards: p.holeCards.map(() => ({ suit: 'spades' as const, rank: 0 })),
       };
     });
     return { ...state, players: maskedPlayers };
   }
 
-  // 房主广播全场状态（底牌自动安全掩码）
   broadcastState(state: GameState) {
-    if (!this.isHost) return;
+    if (!this.isHost || !this.client || !this.client.connected) return;
 
-    this.connections.forEach((conn, peerId) => {
-      if (conn.open) {
-        conn.send({
+    this.connectedClients.forEach(peerId => {
+      this.client!.publish(
+        `${this.topicPrefix}/to/${peerId}`,
+        JSON.stringify({
           type: 'STATE_UPDATE',
-          state: this.maskStateForPeer(state, peerId)
-        });
-      }
+          state: this.maskStateForPeer(state, peerId),
+        }),
+        { qos: 1 }
+      );
     });
   }
 
-  // 房主给指定玩家发送私有手牌
   sendPrivateCards(peerId: string, cards: any[]) {
-    const conn = this.connections.get(peerId);
-    if (conn && conn.open) {
-      conn.send({
+    if (!this.client || !this.client.connected) return;
+    this.client.publish(
+      `${this.topicPrefix}/to/${peerId}`,
+      JSON.stringify({
         type: 'DEAL_CARDS',
-        cards
-      });
-    }
+        cards,
+      }),
+      { qos: 1 }
+    );
   }
 
-  // 玩家向房主发送出牌操作
   sendAction(action: GameAction) {
-    if (this.hostConnection && this.hostConnection.open) {
-      this.hostConnection.send({
+    if (!this.client || !this.client.connected) return;
+    this.client.publish(
+      `${this.topicPrefix}/to/host`,
+      JSON.stringify({
         type: 'PLAYER_ACTION',
-        action
-      });
-    }
+        action,
+      }),
+      { qos: 1 }
+    );
   }
 
-  // 玩家向房主请求补买筹码
   sendRebuyRequest(playerId: string) {
-    if (this.hostConnection && this.hostConnection.open) {
-      this.hostConnection.send({
+    if (!this.client || !this.client.connected) return;
+    this.client.publish(
+      `${this.topicPrefix}/to/host`,
+      JSON.stringify({
         type: 'REBUY_REQUEST',
-        playerId
-      });
-    }
+        playerId,
+      }),
+      { qos: 1 }
+    );
   }
 
   destroy() {
-    this.connections.forEach(conn => conn.close());
-    this.connections.clear();
-    this.hostConnection?.close();
-    this.peer?.destroy();
+    if (typeof document !== 'undefined' && this.visibilityHandler) {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+    }
+    if (typeof window !== 'undefined' && this.unloadHandler) {
+      window.removeEventListener('pagehide', this.unloadHandler);
+      window.removeEventListener('beforeunload', this.unloadHandler);
+    }
+    if (this.client) {
+      if (!this.isHost && this.client.connected && this.myId) {
+        this.client.publish(
+          `${this.topicPrefix}/to/host`,
+          JSON.stringify({ type: 'PLAYER_LEAVE', playerId: this.myId })
+        );
+      }
+      this.client.end(true);
+      this.client = null;
+    }
+    this.connectedClients.clear();
   }
 }
