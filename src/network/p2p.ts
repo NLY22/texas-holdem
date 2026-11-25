@@ -1,5 +1,5 @@
 import Peer, { DataConnection } from 'peerjs';
-import { GameAction, GameState, P2PMessage, Player } from '../types/poker';
+import { GameAction, GameState, P2PMessage } from '../types/poker';
 
 export class P2PNetwork {
   private peer: Peer | null = null;
@@ -12,6 +12,8 @@ export class P2PNetwork {
   private onDealCardsCb?: (cards: any[]) => void;
   private onActionReceivedCb?: (action: GameAction) => void;
   private onPlayerJoinRequestCb?: (conn: DataConnection, data: any) => void;
+  private onPlayerDisconnectCb?: (peerId: string) => void;
+  private onRebuyRequestCb?: (playerId: string) => void;
 
   constructor(
     callbacks: {
@@ -19,12 +21,16 @@ export class P2PNetwork {
       onDealCards?: (cards: any[]) => void;
       onActionReceived?: (action: GameAction) => void;
       onPlayerJoinRequest?: (conn: DataConnection, data: any) => void;
+      onPlayerDisconnect?: (peerId: string) => void;
+      onRebuyRequest?: (playerId: string) => void;
     }
   ) {
     this.onStateUpdateCb = callbacks.onStateUpdate;
     this.onDealCardsCb = callbacks.onDealCards;
     this.onActionReceivedCb = callbacks.onActionReceived;
     this.onPlayerJoinRequestCb = callbacks.onPlayerJoinRequest;
+    this.onPlayerDisconnectCb = callbacks.onPlayerDisconnect;
+    this.onRebuyRequestCb = callbacks.onRebuyRequest;
   }
 
   // 1. 作为房主创建房间
@@ -50,7 +56,6 @@ export class P2PNetwork {
 
       this.peer.on('error', err => {
         console.error('PeerJS 出错:', err);
-        // 如果 ID 冲突，生成新 ID 兜底
         if (err.type === 'unavailable-id') {
           reject(new Error('房间号已被占用，请换一个房间号'));
         } else {
@@ -65,6 +70,7 @@ export class P2PNetwork {
     return new Promise((resolve, reject) => {
       this.isHost = false;
       this.peer = new Peer({ debug: 1 });
+      let settled = false;
 
       this.peer.on('open', myId => {
         this.myId = myId;
@@ -78,25 +84,36 @@ export class P2PNetwork {
         conn.on('open', () => {
           console.log('已连通房主，正在发送入座请求...');
           this.hostConnection = conn;
-          this.setupConnection(conn);
+          this.setupConnection(conn, response => {
+            if (!settled) {
+              settled = true;
+              if (response.success) {
+                resolve();
+              } else {
+                conn.close();
+                reject(new Error(response.error || '加入房间失败'));
+              }
+            }
+          });
 
-          // 发送入座请求
           conn.send({
             type: 'JOIN_REQUEST',
             name: playerName,
             avatar,
           });
-
-          resolve();
         });
 
         conn.on('error', err => {
           console.error('连接房主失败:', err);
-          reject(err);
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
         });
 
         setTimeout(() => {
-          if (!this.hostConnection?.open) {
+          if (!settled) {
+            settled = true;
             reject(new Error('连接房间超时，请检查房间号是否正确或房主是否在线'));
           }
         }, 8000);
@@ -104,12 +121,18 @@ export class P2PNetwork {
 
       this.peer.on('error', err => {
         console.error('P2P 错误:', err);
-        reject(err);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
       });
     });
   }
 
-  private setupConnection(conn: DataConnection) {
+  private setupConnection(
+    conn: DataConnection,
+    onJoinResponse?: (res: { success: boolean; error?: string }) => void
+  ) {
     conn.on('data', rawData => {
       const msg = rawData as P2PMessage;
 
@@ -118,6 +141,13 @@ export class P2PNetwork {
           if (this.isHost) {
             this.connections.set(conn.peer, conn);
             this.onPlayerJoinRequestCb?.(conn, msg);
+          }
+          break;
+
+        case 'JOIN_RESPONSE':
+          onJoinResponse?.({ success: msg.success, error: msg.error });
+          if (msg.success && msg.state) {
+            this.onStateUpdateCb?.(msg.state);
           }
           break;
 
@@ -134,37 +164,61 @@ export class P2PNetwork {
             this.onActionReceivedCb?.(msg.action);
           }
           break;
+
+        case 'REBUY_REQUEST':
+          if (this.isHost) {
+            this.onRebuyRequestCb?.(msg.playerId);
+          }
+          break;
       }
     });
 
     conn.on('close', () => {
       console.log('连接断开:', conn.peer);
       this.connections.delete(conn.peer);
+      if (this.isHost) {
+        this.onPlayerDisconnectCb?.(conn.peer);
+      }
     });
+  }
+
+  sendJoinResponse(peerId: string, success: boolean, state?: GameState, error?: string) {
+    const conn = this.connections.get(peerId);
+    if (conn && conn.open) {
+      const maskedState = state ? this.maskStateForPeer(state, peerId) : undefined;
+      conn.send({
+        type: 'JOIN_RESPONSE',
+        success,
+        state: maskedState,
+        error
+      });
+    }
+  }
+
+  private maskStateForPeer(state: GameState, peerId: string): GameState {
+    const maskedPlayers = state.players.map(p => {
+      if (!p) return null;
+      // 仅允许该玩家本人查看自己底牌，或合法摊牌亮牌玩家 (showCards === true)
+      if (p.id === peerId || p.showCards) {
+        return p;
+      }
+      return {
+        ...p,
+        holeCards: p.holeCards.map(() => ({ suit: 'spades' as const, rank: 0 }))
+      };
+    });
+    return { ...state, players: maskedPlayers };
   }
 
   // 房主广播全场状态（底牌自动安全掩码）
   broadcastState(state: GameState) {
     if (!this.isHost) return;
 
-    // 针对每个客户端，只广播对手的背面手牌，保持手牌绝密
     this.connections.forEach((conn, peerId) => {
       if (conn.open) {
-        const maskedPlayers = state.players.map(p => {
-          if (!p) return null;
-          // 若为该玩家本人或已处于摊牌阶段，允许看牌
-          if (p.id === peerId || state.stage === 'SHOWDOWN' || p.showCards) {
-            return p;
-          }
-          return {
-            ...p,
-            holeCards: p.holeCards.map(() => ({ suit: 'spades' as const, rank: 0 }))
-          };
-        });
-
         conn.send({
           type: 'STATE_UPDATE',
-          state: { ...state, players: maskedPlayers }
+          state: this.maskStateForPeer(state, peerId)
         });
       }
     });
@@ -187,6 +241,16 @@ export class P2PNetwork {
       this.hostConnection.send({
         type: 'PLAYER_ACTION',
         action
+      });
+    }
+  }
+
+  // 玩家向房主请求补买筹码
+  sendRebuyRequest(playerId: string) {
+    if (this.hostConnection && this.hostConnection.open) {
+      this.hostConnection.send({
+        type: 'REBUY_REQUEST',
+        playerId
       });
     }
   }

@@ -378,7 +378,13 @@ export function handlePlayerAction(
   if (nonFolded.length === 1) {
     const soleWinner = nonFolded[0];
     const finalPlayers = updatedPlayers.map(p =>
-      p && p.id === soleWinner.id ? { ...p, chips: p.chips + totalPot } : p
+      p
+        ? {
+            ...p,
+            currentBet: 0,
+            chips: p.id === soleWinner.id ? p.chips + totalPot : p.chips
+          }
+        : null
     );
     const winners: WinnerInfo[] = [{
       playerId: soleWinner.id,
@@ -393,6 +399,7 @@ export function handlePlayerAction(
         ...state,
         stage: 'SHOWDOWN',
         totalPot: 0,
+        currentBet: 0,
         activePlayerIndex: -1,
         pendingPlayerIds: [],
         players: finalPlayers,

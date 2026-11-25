@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GameAction, GameState, Player, Card } from './types/poker';
-import { createInitialState, startNewHand, handlePlayerAction } from './engine/state-machine';
+import { createInitialState, startNewHand, handlePlayerAction, advanceStage } from './engine/state-machine';
 import { getBotAction } from './engine/bot';
 import { P2PNetwork } from './network/p2p';
 import { Table } from './components/Table';
@@ -33,6 +33,12 @@ export const App: React.FC = () => {
       },
       onActionReceived: (action) => {
         processActionAsHost(action);
+      },
+      onPlayerDisconnect: (peerId) => {
+        handlePlayerDisconnectAsHost(peerId);
+      },
+      onRebuyRequest: (playerId) => {
+        handleRebuyAsHost(playerId);
       }
     });
 
@@ -72,10 +78,22 @@ export const App: React.FC = () => {
 
   // 2. 初始化加入玩家网络
   const initClientGame = async (roomId: string, playerName: string) => {
+    let myAssignedId = '';
     const net = new P2PNetwork({
       onStateUpdate: (state) => {
         stateRef.current = state;
         setGameState(state);
+
+        if (state.stage === 'WAITING' || state.stage === 'SHOWDOWN') {
+          setMyPrivateCards([]);
+        } else {
+          const self = state.players.find(p => p && p.id === (net.myId || myAssignedId));
+          if (self && self.holeCards.length === 2 && self.holeCards[0].rank > 0) {
+            setMyPrivateCards(self.holeCards);
+          } else if (self && self.holeCards.length === 0) {
+            setMyPrivateCards([]);
+          }
+        }
       },
       onDealCards: (cards) => {
         setMyPrivateCards(cards);
@@ -84,6 +102,7 @@ export const App: React.FC = () => {
 
     try {
       await net.joinRoom(roomId, playerName, '');
+      myAssignedId = net.myId;
       networkRef.current = net;
       setIsHost(false);
       setLocalPlayerId(net.myId);
@@ -93,11 +112,23 @@ export const App: React.FC = () => {
     }
   };
 
-  // 3. 房主处理新玩家入座
+  // 3. 房主处理新玩家入座 (含满座拒绝与中途加入观战保护)
   const handleNewPlayerJoin = (peerId: string, name: string, avatar: string) => {
     const currentState = stateRef.current;
+    // 防重连重复占座
+    const existingIdx = currentState.players.findIndex(p => p && p.id === peerId);
+    if (existingIdx !== -1) {
+      networkRef.current?.sendJoinResponse(peerId, true, currentState);
+      return;
+    }
+
     const emptySeatIndex = currentState.players.findIndex(p => p === null);
-    if (emptySeatIndex === -1) return;
+    if (emptySeatIndex === -1) {
+      networkRef.current?.sendJoinResponse(peerId, false, undefined, '房间已满 (最多6人)');
+      return;
+    }
+
+    const isMidHand = currentState.stage !== 'WAITING' && currentState.stage !== 'SHOWDOWN';
 
     const newPlayer: Player = {
       id: peerId,
@@ -107,7 +138,7 @@ export const App: React.FC = () => {
       currentBet: 0,
       totalRoundBet: 0,
       holeCards: [],
-      folded: false,
+      folded: isMidHand, // 若牌局已开始中途加入，本局观战，下一手自动参与
       isAllIn: false,
       isBot: false,
       seatIndex: emptySeatIndex
@@ -123,10 +154,92 @@ export const App: React.FC = () => {
 
     stateRef.current = updatedState;
     setGameState(updatedState);
+    networkRef.current?.sendJoinResponse(peerId, true, updatedState);
     networkRef.current?.broadcastState(updatedState);
   };
 
-  // 4. 发牌开局
+  // 4. 房主处理远端玩家掉线，避免牌局卡死
+  const handlePlayerDisconnectAsHost = (peerId: string) => {
+    const currentState = stateRef.current;
+    const idx = currentState.players.findIndex(p => p && p.id === peerId);
+    if (idx === -1) return;
+
+    // 若未在牌局中，直接释放席位
+    if (currentState.stage === 'WAITING' || currentState.stage === 'SHOWDOWN') {
+      const updatedPlayers = [...currentState.players];
+      updatedPlayers[idx] = null;
+      const nextState = { ...currentState, players: updatedPlayers };
+      stateRef.current = nextState;
+      setGameState(nextState);
+      networkRef.current?.broadcastState(nextState);
+      return;
+    }
+
+    // 牌局进行中掉线：若正好轮到他，直接替他 FOLD 推进牌局
+    if (currentState.activePlayerIndex === idx) {
+      const { state: afterFold, deck } = handlePlayerAction(
+        currentState,
+        { type: 'FOLD', playerId: peerId },
+        deckRef.current
+      );
+      deckRef.current = deck;
+      const cleanedPlayers = afterFold.players.map((p, i) => (i === idx ? null : p));
+      const nextState = { ...afterFold, players: cleanedPlayers };
+      stateRef.current = nextState;
+      setGameState(nextState);
+      networkRef.current?.broadcastState(nextState);
+      return;
+    }
+
+    // 未轮到他：标记弃牌、移出待行动列表，若只剩一人则直接结束
+    const updatedPlayers = currentState.players.map((p, i) => (i === idx ? null : p));
+    const remainingPending = currentState.pendingPlayerIds.filter(id => id !== peerId);
+    const nonFolded = updatedPlayers.filter((p): p is Player => p !== null && !p.folded);
+
+    let nextState: GameState = {
+      ...currentState,
+      players: updatedPlayers,
+      pendingPlayerIds: remainingPending
+    };
+
+    if (nonFolded.length === 1) {
+      const winner = nonFolded[0];
+      nextState = {
+        ...nextState,
+        stage: 'SHOWDOWN',
+        totalPot: 0,
+        currentBet: 0,
+        activePlayerIndex: -1,
+        pendingPlayerIds: [],
+        players: updatedPlayers.map(p =>
+          p
+            ? {
+                ...p,
+                currentBet: 0,
+                chips: p.id === winner.id ? p.chips + currentState.totalPot : p.chips
+              }
+            : null
+        ),
+        winners: [{
+          playerId: winner.id,
+          name: winner.name,
+          amount: currentState.totalPot,
+          handName: '对手离线获胜',
+          cards: winner.holeCards
+        }]
+      };
+    } else if (remainingPending.length === 0) {
+      const res = advanceStage(nextState, deckRef.current);
+      deckRef.current = res.deck;
+      nextState = res.state;
+    }
+
+    stateRef.current = nextState;
+    setGameState(nextState);
+    networkRef.current?.broadcastState(nextState);
+  };
+
+  // 5. 发牌开局
   const handleStartHand = () => {
     if (!isHost) return;
     soundManager.playCardDeal();
@@ -150,6 +263,8 @@ export const App: React.FC = () => {
     const humanPlayer = nextState.players.find(p => p && p.id === localPlayerId);
     if (humanPlayer && humanPlayer.holeCards.length === 2) {
       setMyPrivateCards(humanPlayer.holeCards);
+    } else {
+      setMyPrivateCards([]);
     }
 
     // 给每个非机器人客户端分发私密底牌
@@ -162,7 +277,7 @@ export const App: React.FC = () => {
     networkRef.current?.broadcastState(nextState);
   };
 
-  // 5. 房主核心处理动作
+  // 6. 房主核心处理动作
   const processActionAsHost = (action: GameAction) => {
     const { state: updatedState, deck } = handlePlayerAction(
       stateRef.current,
@@ -175,7 +290,7 @@ export const App: React.FC = () => {
     networkRef.current?.broadcastState(updatedState);
   };
 
-  // 6. 监听是否轮到电脑玩家 (Bot) 行动
+  // 7. 监听是否轮到电脑玩家 (Bot) 行动
   useEffect(() => {
     if (!isHost) return;
     const currentState = gameState;
@@ -199,7 +314,7 @@ export const App: React.FC = () => {
     }
   }, [gameState.activePlayerIndex, gameState.stage, isHost]);
 
-  // 7. 发送玩家操作
+  // 8. 发送玩家操作
   const handleLocalAction = (action: GameAction) => {
     if (isHost) {
       processActionAsHost(action);
@@ -208,7 +323,7 @@ export const App: React.FC = () => {
     }
   };
 
-  // 8. 房主添加 AI 电脑玩家
+  // 9. 房主添加 AI 电脑玩家
   const handleAddBot = (seatIdx?: number) => {
     if (!isHost) return;
     const currentState = stateRef.current;
@@ -242,7 +357,7 @@ export const App: React.FC = () => {
     networkRef.current?.broadcastState(nextState);
   };
 
-  // 9. 等待阶段房主换座
+  // 10. 等待阶段房主换座
   const handleSitDown = (targetSeatIndex: number) => {
     if (!isHost || stateRef.current.stage !== 'WAITING') return;
     const currentState = stateRef.current;
@@ -262,12 +377,11 @@ export const App: React.FC = () => {
     networkRef.current?.broadcastState(nextState);
   };
 
-  // 10. 本地玩家重买筹码
-  const handleRebuy = () => {
-    if (!isHost) return;
+  // 11. 房主处理任意玩家重买筹码
+  const handleRebuyAsHost = (targetPlayerId: string) => {
     const currentState = stateRef.current;
     const updatedPlayers = currentState.players.map(p =>
-      p && p.id === localPlayerId && p.chips <= 0 ? { ...p, chips: 1000 } : p
+      p && p.id === targetPlayerId && p.chips <= 0 ? { ...p, chips: 1000 } : p
     );
     const nextState = { ...currentState, players: updatedPlayers };
     stateRef.current = nextState;
@@ -275,7 +389,15 @@ export const App: React.FC = () => {
     networkRef.current?.broadcastState(nextState);
   };
 
-  // 11. 一键单人秒开 (完全本地即时初始化，零等待零网络依赖)
+  const handleRebuy = () => {
+    if (isHost) {
+      handleRebuyAsHost(localPlayerId);
+    } else {
+      networkRef.current?.sendRebuyRequest(localPlayerId);
+    }
+  };
+
+  // 12. 一键单人秒开 (完全本地即时初始化，零等待零网络依赖)
   const handleQuickPractice = () => {
     const localId = 'local-player-0';
     setLocalPlayerId(localId);
@@ -372,7 +494,7 @@ export const App: React.FC = () => {
         />
       )}
 
-      {/* 核心扑克桌 (上下均预留安全区，防止顶部席位触及顶栏、底部席位触及操作栏) */}
+      {/* 核心扑克桌 */}
       {!inLobby && (
         <main className="flex-1 w-full flex items-center justify-center px-2 pt-10 pb-40 sm:pb-44 relative">
           <Table
@@ -381,7 +503,7 @@ export const App: React.FC = () => {
             onSitDown={isHost ? handleSitDown : undefined}
             onAddBot={isHost ? seatIdx => handleAddBot(seatIdx) : undefined}
             onNextHand={isHost && activeCount >= 2 ? handleStartHand : undefined}
-            onRebuy={isHost ? handleRebuy : undefined}
+            onRebuy={handleRebuy}
           />
         </main>
       )}

@@ -91,5 +91,6 @@ export type P2PMessage =
   | { type: 'STATE_UPDATE'; state: GameState }
   | { type: 'DEAL_CARDS'; cards: Card[] }
   | { type: 'PLAYER_ACTION'; action: GameAction }
+  | { type: 'REBUY_REQUEST'; playerId: string }
   | { type: 'CHAT_MESSAGE'; sender: string; text: string }
   | { type: 'RESTART_GAME' };
